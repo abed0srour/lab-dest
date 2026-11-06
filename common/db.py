@@ -28,6 +28,11 @@ CREATE TABLE IF NOT EXISTS objects (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (bucket, key, version)
 );
+-- Phase 5: whole-object SHA-256 (served as the ETag) and the content type given at upload.
+ALTER TABLE objects ADD COLUMN IF NOT EXISTS sha256 TEXT;
+ALTER TABLE objects ADD COLUMN IF NOT EXISTS content_type TEXT;
+CREATE INDEX IF NOT EXISTS objects_tags ON objects USING gin (tags);
+CREATE INDEX IF NOT EXISTS objects_created ON objects (created_at);
 -- A chunk is identified by its hash *and* the redundancy scheme of the bucket that stores it,
 -- so a replicated bucket and an erasure-coded bucket never share (and weaken) each other's copies.
 CREATE TABLE IF NOT EXISTS chunks (

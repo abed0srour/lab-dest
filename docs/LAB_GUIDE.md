@@ -18,8 +18,8 @@ At the end you will find the **3 flowcharts** the report needs, a **Word report 
 | 2 | Storage node module | ✅ Done |
 | 3 | Metadata and placement | ✅ Done |
 | 4 | Redundancy and recovery | ✅ Done |
-| 5 | API gateway | ⬜ Next |
-| 6 | Web UI + Elasticsearch search | ⬜ |
+| 5 | API gateway | ✅ Done |
+| 6 | Web UI + Elasticsearch search | ⬜ Next |
 | 7 | Load balancing and fault tolerance (bonus) | ⬜ |
 | 8 | Cloud deployment (bonus) | ⬜ |
 
@@ -346,39 +346,59 @@ powershell -ExecutionPolicy Bypass -File scripts\demo_phase4.ps1
 
 **Goal:** an S3-like public API that hides chunks and nodes from the user.
 
-**What gets built:** a FastAPI service in `gateway/`.
+**What was built:** [gateway/app.py](../gateway/app.py), a FastAPI service on port **8080**. Its interactive docs are at http://127.0.0.1:8080/docs (click **Authorize** and enter a key).
 
 | Method | Path | Purpose |
 |---|---|---|
-| PUT | `/buckets/{bucket}` | Create a bucket (choose `replication` or `ec`) |
+| PUT | `/buckets/{bucket}?redundancy=replication\|ec` | Create a bucket |
 | GET | `/buckets` | List buckets |
-| PUT | `/buckets/{bucket}/objects/{key}` | Upload (streamed, so large files never sit fully in memory). Tags go in the `X-Tags` header, for example `type=video,project=lab` |
-| GET | `/buckets/{bucket}/objects/{key}` | Download. `Range: bytes=0-1023` returns **206 Partial Content** |
-| HEAD | `/buckets/{bucket}/objects/{key}` | Metadata only |
-| DELETE | `/buckets/{bucket}/objects/{key}` | Delete (chunk reference counts go down) |
+| PUT | `/buckets/{bucket}/objects/{key}` | Upload. The body is **streamed** through the chunker to the nodes, so any size works without filling memory. Headers: `X-Tags: type=video,project=lab`, `Content-Type`. `?chunking=cdc` for FastCDC. Same key again = new version |
+| GET | `/buckets/{bucket}/objects/{key}` | Download (streamed). `Range: bytes=a-b`, `a-` or `-n` → **206** with `Content-Range`; past the end → **416**. `?version=N` |
+| GET | `/buckets/{bucket}/objects/{key}?metadata=true` | Metadata as JSON, including the chunk list and where each chunk is stored |
+| HEAD | `/buckets/{bucket}/objects/{key}` | Metadata in headers: `ETag` (SHA-256), `Last-Modified`, `X-Tags`, `X-Object-Version`, `X-Redundancy` |
+| DELETE | `/buckets/{bucket}/objects/{key}` | Delete (all versions, or `?version=N`) |
 | GET | `/buckets/{bucket}/objects?prefix=` | List objects |
-| GET | `/search?prefix=&min_size=&max_size=&after=&before=&tag=` | Search |
-| GET | `/cluster/status` | Nodes, free space, chunks per node, degraded objects |
+| GET | `/search?bucket=&prefix=&min_size=&max_size=&after=&before=&tag=k=v` | Search; `tag` can be repeated |
+| GET | `/cluster/status` | Nodes (status, free space, chunks per node), degraded objects, repair queue |
+| GET | `/health` | Public health check |
 
-- **Authentication:** an `X-API-Key` header. A missing or wrong key returns **401**.
-- **Rate limiting:** for example 100 requests per minute per key. Over the limit returns **429**.
-- **Tests:** `tests/test_gateway.py` (pytest), a Postman collection in `tests/postman/`, and curl examples.
-- **Workload benchmark**, `scripts/bench_workloads.py`: upload and download all 5,000 small files and all 10 large files, then report throughput (MB/s, files/s) and latency.
+- **Authentication:** every request except `/health` and the docs needs `X-API-Key`. Missing or wrong → **401**. Keys are set in `docker-compose.yml`:
+  - `student-key-2026`: 200 requests/s;
+  - `demo-key-2026`: 5 requests/s, to show the limit;
+  - `bench-key-2026`: for the benchmark.
+- **Rate limiting:** a token bucket per key, allowing 2 seconds of burst. Over the limit → **429** with `Retry-After`.
+- **Every response** carries `X-Gateway-Id`, which Phase 7 uses to show the load balancer at work.
+- **Tests:** [tests/test_gateway.py](../tests/test_gateway.py) (16 API tests, 48 in total) and a Postman collection, [tests/postman/lab-dest-gateway.postman_collection.json](../tests/postman/lab-dest-gateway.postman_collection.json) (14 requests with checks).
+- **Demo:** [scripts/demo_phase5.ps1](../scripts/demo_phase5.ps1), every endpoint with curl, pausing after each step.
+- **Workload benchmark:** [scripts/bench_workloads.py](../scripts/bench_workloads.py). Through the gateway, it uploads and downloads both workloads in both schemes with 8 parallel clients, checks every download against its SHA-256, and reports files/s, MB/s and latency.
+
+**Measured** (`bench_workloads.py`, 8 parallel clients; all 10,010 downloads matched their SHA-256):
+
+| Workload | Scheme | Upload | Download | Median latency (up / down) |
+|---|---|---|---|---|
+| Small: 5,000 files, 122 MB | Replication | 49 files/s | 91 files/s | 158 / 85 ms |
+| Small | EC 4 + 2 | 47 files/s | 91 files/s | 159 / 84 ms |
+| Large: 5 images, 923 MB | Replication | 98.9 MB/s | 133.5 MB/s | 9.5 / 7.1 s per file |
+| Large | EC 4 + 2 | 92.3 MB/s | 109.0 MB/s | 10.2 / 8.7 s per file |
+
+Small files are limited by requests (each upload means about 6 internal requests and a database commit). Large files are limited by bandwidth.
 
 | Fig | Screenshot | How to show it |
 |---|---|---|
-| 5.1 | All endpoints | Browser: http://localhost:8080/docs |
-| 5.2 | Create and list buckets | curl |
-| 5.3 | Upload a large file (time, MB/s) | curl with `-w "%{time_total}"` |
-| 5.4 | Byte-range download returns 206 with a `Content-Range` header | `curl.exe -r 0-1023 -i ...` |
-| 5.5 | List, metadata (HEAD), delete | curl |
-| 5.6 | Search by prefix, size, date, tag | curl |
-| 5.7 | Cluster status | `curl.exe http://localhost:8080/cluster/status` |
-| 5.8 | No or wrong API key returns 401 | curl without the header |
-| 5.9 | Rate limit returns 429 | Loop of requests |
-| 5.10 | Tests pass | `pytest -v` |
-| 5.11 | Postman collection run | Postman Runner window |
-| 5.12 | Small vs large workload results | `bench_workloads.py` table |
+| 5.1 | All endpoints, with the Authorize button | Browser: http://127.0.0.1:8080/docs |
+| 5.2 | No or wrong key → 401 | Demo step 1 |
+| 5.3 | Create and list buckets | Demo step 2 |
+| 5.4 | Streamed upload of 216 MB (time, MB/s) into both schemes, plus small files with tags | Demo step 3 |
+| 5.5 | Full download (SHA-256 matches); ranges → 206 and 416 | Demo step 4 |
+| 5.6 | HEAD and metadata JSON | Demo step 5 |
+| 5.7 | List by prefix; search by size, tag and date | Demo step 6 |
+| 5.8 | Delete, then 404 | Demo step 7 |
+| 5.9 | Cluster status | Demo step 8 |
+| 5.10 | Rate limit → 429 with Retry-After | Demo step 9 |
+| 5.11 | Trying an endpoint in Swagger (Authorize → upload or search → Execute) | Browser |
+| 5.12 | Small vs large workload results | `.\.venv\Scripts\python.exe scripts\bench_workloads.py` (on an empty cluster) |
+| 5.13 | All tests pass | `.\.venv\Scripts\python.exe -m pytest -v` |
+| 5.14 (optional) | Postman collection run | Postman → Import the collection → Run |
 
 **In the report, explain:**
 

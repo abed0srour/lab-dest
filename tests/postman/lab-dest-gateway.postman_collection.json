@@ -1,0 +1,154 @@
+{
+  "info": {
+    "name": "lab-dest gateway API",
+    "description": "Tests for the distributed storage gateway. Import into Postman, start the cluster (docker compose up -d), then run the whole collection with the Collection Runner. Variables: baseUrl, apiKey, bucket.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "apikey",
+    "apikey": [
+      { "key": "key", "value": "X-API-Key", "type": "string" },
+      { "key": "value", "value": "{{apiKey}}", "type": "string" },
+      { "key": "in", "value": "header", "type": "string" }
+    ]
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://127.0.0.1:8080" },
+    { "key": "apiKey", "value": "student-key-2026" },
+    { "key": "bucket", "value": "postman-demo" },
+    { "key": "content", "value": "Hello from Postman! This object is stored as content-addressed chunks." }
+  ],
+  "item": [
+    {
+      "name": "01 Health (no key needed)",
+      "request": { "auth": { "type": "noauth" }, "method": "GET", "url": "{{baseUrl}}/health" },
+      "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": [
+        "pm.test('status 200', () => pm.response.to.have.status(200));",
+        "pm.test('gateway is ok', () => pm.expect(pm.response.json().status).to.eql('ok'));"
+      ] } }]
+    },
+    {
+      "name": "02 Request without API key is refused",
+      "request": { "auth": { "type": "noauth" }, "method": "GET", "url": "{{baseUrl}}/buckets" },
+      "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": [
+        "pm.test('status 401', () => pm.response.to.have.status(401));"
+      ] } }]
+    },
+    {
+      "name": "03 Create bucket",
+      "request": { "method": "PUT", "url": "{{baseUrl}}/buckets/{{bucket}}" },
+      "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": [
+        "pm.test('created (201) or already there (200)', () => pm.expect(pm.response.code).to.be.oneOf([200, 201]));",
+        "pm.test('replicated bucket', () => pm.expect(pm.response.json().redundancy).to.eql('replication'));"
+      ] } }]
+    },
+    {
+      "name": "04 List buckets",
+      "request": { "method": "GET", "url": "{{baseUrl}}/buckets" },
+      "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": [
+        "pm.test('status 200', () => pm.response.to.have.status(200));",
+        "pm.test('our bucket is listed', () => pm.expect(pm.response.json().map(b => b.name)).to.include(pm.collectionVariables.get('bucket')));"
+      ] } }]
+    },
+    {
+      "name": "05 Upload object with tags",
+      "request": {
+        "method": "PUT",
+        "header": [
+          { "key": "Content-Type", "value": "text/plain" },
+          { "key": "X-Tags", "value": "type=greeting,tool=postman" }
+        ],
+        "body": { "mode": "raw", "raw": "{{content}}", "options": { "raw": { "language": "text" } } },
+        "url": "{{baseUrl}}/buckets/{{bucket}}/objects/hello.txt"
+      },
+      "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": [
+        "pm.test('status 201', () => pm.response.to.have.status(201));",
+        "const r = pm.response.json();",
+        "pm.test('size matches the body', () => pm.expect(r.size).to.eql(pm.collectionVariables.get('content').length));",
+        "pm.test('tags stored', () => pm.expect(r.tags).to.eql({ type: 'greeting', tool: 'postman' }));",
+        "pm.collectionVariables.set('sha256', r.sha256);"
+      ] } }]
+    },
+    {
+      "name": "06 Download object",
+      "request": { "method": "GET", "url": "{{baseUrl}}/buckets/{{bucket}}/objects/hello.txt" },
+      "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": [
+        "pm.test('status 200', () => pm.response.to.have.status(200));",
+        "pm.test('same content as uploaded', () => pm.expect(pm.response.text()).to.eql(pm.collectionVariables.get('content')));",
+        "pm.test('ETag is the SHA-256', () => pm.expect(pm.response.headers.get('ETag')).to.eql('\"' + pm.collectionVariables.get('sha256') + '\"'));"
+      ] } }]
+    },
+    {
+      "name": "07 Byte-range request",
+      "request": {
+        "method": "GET",
+        "header": [{ "key": "Range", "value": "bytes=0-4" }],
+        "url": "{{baseUrl}}/buckets/{{bucket}}/objects/hello.txt"
+      },
+      "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": [
+        "pm.test('status 206 Partial Content', () => pm.response.to.have.status(206));",
+        "pm.test('first 5 bytes', () => pm.expect(pm.response.text()).to.eql('Hello'));",
+        "pm.test('Content-Range header', () => pm.expect(pm.response.headers.get('Content-Range')).to.eql('bytes 0-4/' + pm.collectionVariables.get('content').length));"
+      ] } }]
+    },
+    {
+      "name": "08 HEAD object (metadata in headers)",
+      "request": { "method": "HEAD", "url": "{{baseUrl}}/buckets/{{bucket}}/objects/hello.txt" },
+      "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": [
+        "pm.test('status 200', () => pm.response.to.have.status(200));",
+        "pm.test('tags header', () => pm.expect(pm.response.headers.get('X-Tags')).to.eql('type=greeting,tool=postman'));",
+        "pm.test('version header', () => pm.expect(pm.response.headers.get('X-Object-Version')).to.exist);"
+      ] } }]
+    },
+    {
+      "name": "09 Object metadata as JSON",
+      "request": { "method": "GET", "url": "{{baseUrl}}/buckets/{{bucket}}/objects/hello.txt?metadata=true" },
+      "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": [
+        "const m = pm.response.json();",
+        "pm.test('status 200', () => pm.response.to.have.status(200));",
+        "pm.test('one chunk stored on 3 nodes', () => { pm.expect(m.chunks.length).to.eql(1); pm.expect(m.chunks[0].stored_on.length).to.eql(3); });",
+        "pm.test('content type kept', () => pm.expect(m.content_type).to.eql('text/plain'));"
+      ] } }]
+    },
+    {
+      "name": "10 List objects by prefix",
+      "request": { "method": "GET", "url": "{{baseUrl}}/buckets/{{bucket}}/objects?prefix=hel" },
+      "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": [
+        "pm.test('hello.txt listed', () => pm.expect(pm.response.json().map(o => o.key)).to.include('hello.txt'));"
+      ] } }]
+    },
+    {
+      "name": "11 Search by tag and size",
+      "request": { "method": "GET", "url": "{{baseUrl}}/search?tag=tool=postman&max_size=1000" },
+      "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": [
+        "const r = pm.response.json();",
+        "pm.test('found', () => pm.expect(r.count).to.be.at.least(1));",
+        "pm.test('every result has the tag', () => r.results.forEach(o => pm.expect(o.tags.tool).to.eql('postman')));"
+      ] } }]
+    },
+    {
+      "name": "12 Cluster status",
+      "request": { "method": "GET", "url": "{{baseUrl}}/cluster/status" },
+      "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": [
+        "const s = pm.response.json();",
+        "pm.test('at least 4 storage nodes', () => pm.expect(s.nodes.length).to.be.at.least(4));",
+        "pm.test('no degraded objects', () => pm.expect(s.objects.degraded).to.eql(0));"
+      ] } }]
+    },
+    {
+      "name": "13 Delete object",
+      "request": { "method": "DELETE", "url": "{{baseUrl}}/buckets/{{bucket}}/objects/hello.txt" },
+      "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": [
+        "pm.test('status 200', () => pm.response.to.have.status(200));",
+        "pm.test('versions deleted', () => pm.expect(pm.response.json().deleted_versions).to.be.at.least(1));"
+      ] } }]
+    },
+    {
+      "name": "14 Deleted object is gone",
+      "request": { "method": "GET", "url": "{{baseUrl}}/buckets/{{bucket}}/objects/hello.txt" },
+      "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": [
+        "pm.test('status 404', () => pm.response.to.have.status(404));"
+      ] } }]
+    }
+  ]
+}

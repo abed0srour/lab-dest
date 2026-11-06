@@ -62,8 +62,9 @@ def print_table(rows: list[dict], cols: list[tuple[str, str]]) -> None:
 
 def write_csv(path: Path, rows: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    fields = list(dict.fromkeys(k for r in rows for k in r))  # rows may have different columns
     with open(path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w = csv.DictWriter(f, fieldnames=fields, restval="")
         w.writeheader()
         w.writerows(rows)
 

@@ -1,0 +1,9 @@
+workload,redundancy,operation,files,mb,seconds,files_per_s,mb_per_s,p50_ms,p95_ms,dedup_chunks,sha256_ok
+small,replication,upload,5000,121.8,101.4,49.3,1.3,157.5,216.9,539,
+small,replication,download,5000,121.8,55.2,90.6,2.3,84.6,120.0,,5000/5000
+small,ec,upload,5000,121.8,106.5,47.0,1.2,158.9,260.6,539,
+small,ec,download,5000,121.8,54.9,91.1,2.3,84.3,118.2,,5000/5000
+large,replication,upload,5,923.0,9.8,0.5,98.9,9484.0,9585.8,0,
+large,replication,download,5,923.0,7.3,0.7,133.5,7130.3,7204.3,,5/5
+large,ec,upload,5,923.0,10.5,0.5,92.3,10227.3,10347.1,0,
+large,ec,download,5,923.0,8.9,0.6,109.0,8746.2,8848.9,,5/5

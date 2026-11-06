@@ -27,7 +27,9 @@ DOWN_FOR = 30.0
 
 
 class StorageError(Exception):
-    pass
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status  # HTTP status from the metadata service, if it came from there
 
 
 class StorageClient:
@@ -69,7 +71,11 @@ class StorageClient:
         retry = method != "POST" or not path.startswith("/buckets/")
         r = self._request(method, f"{self.metadata_url}{path}", retry=retry, **kwargs)
         if r.status_code >= 400:
-            raise StorageError(f"{method} {path} -> {r.status_code}: {r.text}")
+            try:
+                detail = r.json().get("detail", r.text)
+            except ValueError:
+                detail = r.text
+            raise StorageError(f"{method} {path} -> {r.status_code}: {detail}", r.status_code)
         return r.json()
 
     def _node(self, method: str, node: dict, blob_hash: str, **kwargs) -> httpx.Response | None:
@@ -110,18 +116,25 @@ class StorageClient:
     def create_bucket(self, bucket: str, redundancy: str = "replication") -> dict:
         return self._meta("PUT", f"/buckets/{bucket}", json={"redundancy": redundancy})
 
+    def get_bucket(self, bucket: str) -> dict:
+        return self._meta("GET", f"/buckets/{bucket}")
+
     def list_buckets(self) -> list[dict]:
         return self._meta("GET", "/buckets")
+
+    def search(self, **filters) -> dict:
+        """Filters: bucket, prefix, min_size, max_size, after, before, tag (list of "key=value"), limit."""
+        return self._meta("GET", "/search", params={k: v for k, v in filters.items() if v not in (None, "", [])})
 
     # ---- write path ----------------------------------------------------------
 
     def put_file(self, bucket: str, key: str, path: str, chunking: str = "fixed",
-                 tags: dict | None = None) -> dict:
+                 tags: dict | None = None, content_type: str | None = None) -> dict:
         with open(path, "rb") as f:
-            return self.put_stream(bucket, key, f, chunking, tags)
+            return self.put_stream(bucket, key, f, chunking, tags, content_type)
 
     def put_stream(self, bucket: str, key: str, stream: BinaryIO, chunking: str = "fixed",
-                   tags: dict | None = None) -> dict:
+                   tags: dict | None = None, content_type: str | None = None) -> dict:
         """Chunk the stream, store new chunks on their ring nodes (quorum write), then commit.
 
         The result includes `sha256`, the hash of the whole object.
@@ -138,9 +151,9 @@ class StorageClient:
                 batch = []
         if batch:
             refs += self._store(bucket, batch, uploaded)
-        body = {"size": sum(r["size"] for r in refs), "chunking": chunking, "tags": tags or {}, "chunks": refs}
-        result = self._meta("POST", self._object_path(bucket, key), json=body)
-        return {**result, "sha256": whole.hexdigest()}
+        body = {"size": sum(r["size"] for r in refs), "chunking": chunking, "tags": tags or {},
+                "sha256": whole.hexdigest(), "content_type": content_type, "chunks": refs}
+        return self._meta("POST", self._object_path(bucket, key), json=body)
 
     def _put_blob(self, node: dict, blob_hash: str, data: bytes) -> bool:
         r = self._node("PUT", node, blob_hash, content=data)
@@ -179,15 +192,24 @@ class StorageClient:
         return self._meta("GET", self._object_path(bucket, key), params={"version": version} if version else None)
 
     def get_file(self, bucket: str, key: str, path: str, version: int | None = None) -> dict:
-        """Download to `path`. The result includes `sha256` of the downloaded data."""
+        """Download to `path`. The result's `sha256` is the hash of the data actually downloaded."""
         meta = self.get_object(bucket, key, version)
         whole = hashlib.sha256()
         with open(path, "wb") as f:
-            for chunk in meta["chunks"]:
-                data = self._read_chunk(chunk, meta["read_quorum"])
+            for data in self.iter_object(meta):
                 whole.update(data)
                 f.write(data)
         return {**meta, "sha256": whole.hexdigest()}
+
+    def iter_object(self, meta: dict, start: int = 0, end: int | None = None):
+        """Yield the bytes start..end (inclusive) of an object, reading only the chunks that overlap them."""
+        end = meta["size"] - 1 if end is None else end
+        for chunk in meta["chunks"]:
+            first, last = chunk["offset"], chunk["offset"] + chunk["size"] - 1
+            if last < start or first > end:
+                continue
+            data = self.read_chunk(chunk, meta["read_quorum"])
+            yield data[max(start - first, 0):min(end, last) - first + 1]
 
     def _get_blob(self, loc: dict, blob_hash: str) -> tuple[bytes | None, str]:
         """(data, "ok"), or (None, "bad") if the node answered with a wrong/missing blob, or (None, "down")."""
@@ -217,7 +239,7 @@ class StorageClient:
         locs = [l for l in chunk["locations"] if l.get("url") and not l.get("bad")]
         return sorted(locs, key=lambda l: (self._is_down(l["node_id"]), not l.get("alive"), l["fragment"]))
 
-    def _read_chunk(self, chunk: dict, read_quorum: int = 1) -> bytes:
+    def read_chunk(self, chunk: dict, read_quorum: int = 1) -> bytes:
         if chunk["redundancy"] == "ec":
             return self._read_fragments(chunk)
         return self._read_replica(chunk, read_quorum)

@@ -12,6 +12,7 @@ import os
 import threading
 from collections import Counter
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Annotated
 
 import httpx
@@ -87,6 +88,8 @@ class ObjectIn(BaseModel):
     size: int
     chunking: str = "fixed"
     tags: dict[str, str] = {}
+    sha256: Sha256 | None = None
+    content_type: str | None = None
     chunks: list[ChunkRef]
 
 
@@ -205,6 +208,14 @@ def create_app() -> FastAPI:
             response.status_code = 200
         return {**row, "created": created}
 
+    @app.get("/buckets/{bucket}")
+    def get_bucket(bucket: str):
+        with pool.connection() as conn:
+            row = conn.execute("SELECT * FROM buckets WHERE name = %s", (bucket,)).fetchone()
+        if row is None:
+            raise HTTPException(404, f"bucket {bucket!r} does not exist")
+        return row
+
     @app.get("/buckets")
     def list_buckets():
         with pool.connection() as conn:
@@ -292,9 +303,10 @@ def create_app() -> FastAPI:
                 "SELECT coalesce(max(version), 0) + 1 AS v FROM objects WHERE bucket = %s AND key = %s",
                 (bucket, key)).fetchone()["v"]
             obj = conn.execute(
-                """INSERT INTO objects (bucket, key, version, size, chunking, tags)
-                   VALUES (%s, %s, %s, %s, %s, %s) RETURNING id, created_at""",
-                (bucket, key, version, body.size, body.chunking, Jsonb(body.tags))).fetchone()
+                """INSERT INTO objects (bucket, key, version, size, chunking, tags, sha256, content_type)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id, created_at""",
+                (bucket, key, version, body.size, body.chunking, Jsonb(body.tags), body.sha256,
+                 body.content_type)).fetchone()
             rows, offset = [], 0
             for seq, c in enumerate(body.chunks):
                 rows.append((obj["id"], seq, c.hash, redundancy, offset))
@@ -305,6 +317,7 @@ def create_app() -> FastAPI:
                        VALUES (%s, %s, %s, %s, %s)""", rows)
 
         return {"bucket": bucket, "key": key, "version": version, "size": body.size, "redundancy": redundancy,
+                "sha256": body.sha256, "content_type": body.content_type, "tags": body.tags,
                 "created_at": obj["created_at"], "chunks": len(body.chunks), "new_chunks": new,
                 "deduplicated_chunks": len(body.chunks) - new, "under_replicated_chunks": degraded}
 
@@ -324,9 +337,36 @@ def create_app() -> FastAPI:
         with pool.connection() as conn:
             bucket_redundancy(conn, bucket)
             return conn.execute(
-                """SELECT DISTINCT ON (key) key, version, size, chunking, tags, created_at
+                """SELECT DISTINCT ON (key) key, version, size, chunking, tags, sha256, content_type, created_at
                    FROM objects WHERE bucket = %s AND key LIKE %s ORDER BY key, version DESC LIMIT %s""",
                 (bucket, like_prefix(prefix), limit)).fetchall()
+
+    @app.get("/search")
+    def search(bucket: str | None = None, prefix: str = "", min_size: int | None = None,
+               max_size: int | None = None, after: datetime | None = None, before: datetime | None = None,
+               tag: Annotated[list[str], Query()] = [], limit: int = Query(100, ge=1, le=10000)):
+        """Latest version of every object matching all the given filters. tag=key=value, repeatable."""
+        try:
+            tags = dict(t.split("=", 1) for t in tag)
+        except ValueError:
+            raise HTTPException(400, "tag filters look like tag=type=video")
+        with pool.connection() as conn:
+            rows = conn.execute(
+                """SELECT * FROM (
+                       SELECT DISTINCT ON (bucket, key) bucket, key, version, size, chunking, tags, sha256,
+                              content_type, created_at
+                       FROM objects ORDER BY bucket, key, version DESC) o
+                   WHERE (%(bucket)s::text IS NULL OR bucket = %(bucket)s)
+                     AND key LIKE %(prefix)s
+                     AND (%(min)s::bigint IS NULL OR size >= %(min)s)
+                     AND (%(max)s::bigint IS NULL OR size <= %(max)s)
+                     AND (%(after)s::timestamptz IS NULL OR created_at >= %(after)s)
+                     AND (%(before)s::timestamptz IS NULL OR created_at < %(before)s)
+                     AND tags @> %(tags)s
+                   ORDER BY bucket, key LIMIT %(limit)s""",
+                {"bucket": bucket, "prefix": like_prefix(prefix), "min": min_size, "max": max_size,
+                 "after": after, "before": before, "tags": Jsonb(tags), "limit": limit}).fetchall()
+        return {"count": len(rows), "results": rows}
 
     @app.get("/buckets/{bucket}/objects/{key:path}")
     def get_object(bucket: str, key: str, version: int | None = None):
