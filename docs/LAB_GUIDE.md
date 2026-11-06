@@ -14,10 +14,10 @@ At the end you will find the **3 flowcharts** the report needs, a **Word report 
 
 | Phase | Assignment task | Status |
 |---|---|---|
-| 1 | Set up the environment | ✅ Done (still to do: first push to GitHub) |
+| 1 | Set up the environment | ✅ Done |
 | 2 | Storage node module | ✅ Done |
-| 3 | Metadata and placement | ⬜ Next |
-| 4 | Redundancy and recovery | ⬜ |
+| 3 | Metadata and placement | ✅ Done |
+| 4 | Redundancy and recovery | ⬜ Next |
 | 5 | API gateway | ⬜ |
 | 6 | Web UI + Elasticsearch search | ⬜ |
 | 7 | Load balancing and fault tolerance (bonus) | ⬜ |
@@ -109,13 +109,7 @@ lab-dest/
 
 **Done:** Python 3.12 with a virtual environment in `.venv`, a Git repository on branch `main`, Docker Desktop, Node.js, and a Docker volume for each storage node.
 Kubernetes is also running: Docker Desktop in kind mode, Kubernetes v1.36.1.
-**Still to do:** create an empty GitHub repository and push to it:
-```powershell
-git remote add origin https://github.com/<your-user>/<repo>.git
-git add -A
-git commit -m "Phase 1-2: environment and storage node"
-git push -u origin main
-```
+**Repository:** https://github.com/abed0srour/lab-dest (first commit `ac2520d`, Phases 1–2).
 
 | Fig | Screenshot | How to show it |
 |---|---|---|
@@ -173,7 +167,7 @@ powershell -ExecutionPolicy Bypass -File scripts\demo_storage_node.ps1
 | 2.4 | Storing, reading, checking and deleting a chunk | Demo script, top part |
 | 2.5 | Corrupted chunk rejected | Demo script, "bit rot" part, plus `docker compose logs storage-node-1 --tail 5` |
 | 2.6 | All tests pass | `.\.venv\Scripts\python.exe -m pytest -v` |
-| 2.7 | Heartbeats arriving | **Take this in Phase 3**, once the metadata service exists: `curl.exe http://localhost:9000/nodes` |
+| 2.7 | Heartbeats arriving | **Take this in Phase 3**, once the metadata service exists: `.\.venv\Scripts\python.exe scripts\cli.py nodes` (same as Fig 3.2) |
 
 **In the report, explain:**
 
@@ -194,51 +188,76 @@ powershell -ExecutionPolicy Bypass -File scripts\demo_storage_node.ps1
 - Decide which nodes store each chunk.
 - Store identical chunks only once.
 
-**What gets built:**
+**What was built:**
 
-1. **PostgreSQL + metadata service** in `docker-compose.yml`. The tables are:
+| File | What it does |
+|---|---|
+| [common/chunking.py](../common/chunking.py) | Fixed 4 MB chunks, and FastCDC (min 1 MB, average 4 MB, max 16 MB). FastCDC is fed 64 MB windows so it works on streams |
+| [common/ring.py](../common/ring.py) | Consistent hashing ring, 128 virtual nodes per node. A chunk goes to the next 3 distinct nodes clockwise from its hash |
+| [common/client.py](../common/client.py) | Write path (chunk → ask metadata → write 3 copies → commit) and read path (fetch each chunk, check its hash). Reused by the gateway in Phase 5 |
+| [metadata/app.py](../metadata/app.py) | Metadata service (FastAPI + PostgreSQL) on port **9000**: heartbeats, buckets, placement and dedup check (`/plan`), object commit and versions, reference counts, garbage collection, `/stats` |
+| [scripts/cli.py](../scripts/cli.py) | Command-line tool: `nodes`, `mb`, `buckets`, `put`, `put-dir`, `get`, `ls`, `stat`, `rm`, `stats` |
+| [scripts/generate_datasets.py](../scripts/generate_datasets.py) | Creates the two workloads in `datasets/` |
+| [scripts/bench_chunking.py](../scripts/bench_chunking.py), [scripts/bench_placement.py](../scripts/bench_placement.py) | Benchmarks; results in `benchmarks/results/*.csv` |
+| [scripts/demo_phase3.ps1](../scripts/demo_phase3.ps1) | Runs the whole Phase 3 demo for the screenshots |
+| `tests/test_ring.py`, `tests/test_chunking.py`, `tests/test_cluster.py` | 15 new tests (22 in total) |
 
-   | Table | Holds |
-   |---|---|
-   | `buckets` | Name, redundancy mode (replication or erasure coding), creation date |
-   | `objects` | Bucket, key, version, size, tags, creation date |
-   | `object_chunks` | The ordered list of chunk hashes for each object |
-   | `chunks` | Hash, size, reference count |
-   | `chunk_locations` | Which node holds each chunk or fragment |
-   | `nodes` | Node id, URL, last heartbeat, free space, chunk count, status |
+**Database tables** (created automatically when the metadata service starts):
 
-2. **Heartbeat receiver.** Each node now shows up as alive in `/nodes`.
-3. **Chunking** in `common/chunking.py`:
-   - fixed-size chunks of 4 MB first;
-   - then **FastCDC** (content-defined chunking, average about 4 MB) for comparison.
-4. **Consistent hashing ring with virtual nodes** in `common/ring.py`. Each physical node gets about 128 points on the ring. A chunk goes to the next N distinct nodes clockwise from its hash.
-5. **Deduplication with reference counting.** A chunk that already exists is not stored again; its count goes up by 1. A chunk is deleted only when its count reaches 0.
-6. **Dataset generator**, `scripts/generate_datasets.py`:
-   - `datasets/small/`: 5,000 text and JSON files of 1–50 KB. About 10% are exact duplicates, so deduplication shows up in the results.
-   - `datasets/large/`: 10 files of 100–300 MB. Some share content, like several versions of the same disk image.
-   - Keeping large files at 100–300 MB keeps the total within your free disk space.
-7. **Command-line tool**, `scripts/cli.py` (`put`, `get`, `ls`, `rm`), for uploading and downloading before the gateway exists.
-8. **Benchmarks** in `scripts/bench_chunking.py` and `scripts/bench_placement.py`, with output in `benchmarks/results/`.
+| Table | Holds |
+|---|---|
+| `buckets` | Name, redundancy mode (replication or erasure coding), creation date |
+| `objects` | Bucket, key, version, size, chunking method, tags, creation date |
+| `object_chunks` | The ordered list of chunk hashes for each object version |
+| `chunks` | Hash, size, reference count |
+| `chunk_locations` | Which nodes hold each chunk |
+| `nodes` | Node id, URLs, last heartbeat, free space, chunk count |
 
-**Results to expect:**
+**Datasets** (`python scripts\generate_datasets.py`, about 3 minutes):
 
-- **Adding** a 5th node to 4 should move only about **20%** (1/5) of the chunk copies.
-- **Removing** a node moves only that node's share.
-- Simple `hash mod N` placement would move about **80%**. Show both numbers for contrast.
-- After inserting a few bytes into the middle of a large file, **fixed-size** chunking changes every chunk after that point, while **FastCDC** changes only one or two. That is why FastCDC deduplicates better.
+- `datasets/small/`: 5,000 files, 121.8 MB, of which 539 are exact duplicates.
+- `datasets/large/`: 10 disk images, 1.80 GB in total. `disk-05` to `disk-09` are new versions of `disk-00` to `disk-04`.
+
+**Measured results:**
+
+| Test | Fixed 4 MB | FastCDC |
+|---|---|---|
+| Large workload: space saved by dedup | 5.2% | **38.7%** |
+| Small workload: space saved by dedup | 11.1% | 11.1% (each small file is a single chunk) |
+| Insert 10 bytes into a 109 MB file: chunks changed | 15 of 28 (57 MB stored again) | **1 of 29 (1.8 MB)** |
+
+| Scenario | Ring: copies moved | Modulo: copies moved | Ring: primary changed | Modulo: primary changed | Ideal |
+|---|---|---|---|---|---|
+| Add a node (4 → 5) | **20.1%** | 39.8% | 20.8% | 79.3% | 20% |
+| Remove a node (5 → 4) | **18.2%** | 40.4% | 20.9% | 80.8% | 20% |
+
+With 1 virtual node per node, the busiest node holds 27% more than average. With 128 it holds only **4.7%** more.
+
+**Check it works:**
+
+```powershell
+docker compose up -d --build
+.\.venv\Scripts\python.exe -m pytest -v
+powershell -ExecutionPolicy Bypass -File scripts\demo_phase3.ps1
+```
+
+> To start again from an empty cluster: `docker compose down -v`, then `docker compose up -d`. This deletes every stored chunk and the whole database.
 
 | Fig | Screenshot | How to show it |
 |---|---|---|
 | 3.1 | PostgreSQL + metadata service running | `docker compose ps` |
-| 3.2 | All nodes sending heartbeats (also counts as Fig 2.7) | `curl.exe http://localhost:9000/nodes` |
+| 3.2 | All 4 nodes sending heartbeats (also counts as Fig 2.7) | `.\.venv\Scripts\python.exe scripts\cli.py nodes` |
 | 3.3 | Database tables | `docker compose exec postgres psql -U dos -d dos -c "\dt"` |
-| 3.4 | Datasets generated | Generator output (file counts and total sizes) |
-| 3.5 | Upload and download a file; SHA-256 is identical | `cli.py put` / `cli.py get`, then `Get-FileHash` on both files |
-| 3.6 | Object metadata with its ordered chunk list | `psql` query on `objects` + `object_chunks` |
-| 3.7 | Fixed-size vs FastCDC comparison | `bench_chunking.py` output table |
-| 3.8 | Deduplication: same file uploaded twice is stored once (count 2). Delete one, count is 1. Delete both, chunk removed | `cli.py` + `psql` on `chunks` |
-| 3.9 | Ring: % of chunks moved when adding and removing a node, vs `hash mod N` | `bench_placement.py` output |
-| 3.10 | Chunks spread evenly across nodes | `bench_placement.py` chart, or `/nodes` chunk counts |
+| 3.4 | Datasets generated | `.\.venv\Scripts\python.exe scripts\generate_datasets.py` output |
+| 3.5 | Upload and download a 194 MB file; SHA-256 identical | Demo script, step 3 |
+| 3.6 | Object metadata with its ordered chunk list and 3 nodes per chunk | Demo script, step 4 |
+| 3.7 | Deduplication: refcount 2 → 1 → chunk removed from 3 nodes | Demo script, step 5 |
+| 3.8 | Fixed-size vs FastCDC on the cluster | Demo script, step 6 |
+| 3.9 | Fixed-size vs FastCDC on both workloads + edit test | `.\.venv\Scripts\python.exe scripts\bench_chunking.py` |
+| 3.10 | Data moved when adding or removing a node; balance by vnodes | `.\.venv\Scripts\python.exe scripts\bench_placement.py` |
+| 3.11 | 5,000 small files uploaded, with dedup | `cli.py mb small`, then `cli.py put-dir small datasets\small`, then `cli.py stats --bucket small` |
+| 3.12 | Chunks spread evenly over the 4 nodes | `cli.py nodes` (after Fig 3.11) |
+| 3.13 | All tests pass | `.\.venv\Scripts\python.exe -m pytest -v` |
 
 **In the report, explain:**
 

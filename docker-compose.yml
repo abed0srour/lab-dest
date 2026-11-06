@@ -15,30 +15,63 @@ x-node-env: &node-env
 services:
   storage-node-1:
     <<: *storage-node
-    environment: { <<: *node-env, NODE_ID: storage-node-1 }
+    environment: { <<: *node-env, NODE_ID: storage-node-1, NODE_PUBLIC_URL: "http://127.0.0.1:8001" }
     volumes: [node1-data:/data]
     ports: ["8001:8000"]
 
   storage-node-2:
     <<: *storage-node
-    environment: { <<: *node-env, NODE_ID: storage-node-2 }
+    environment: { <<: *node-env, NODE_ID: storage-node-2, NODE_PUBLIC_URL: "http://127.0.0.1:8002" }
     volumes: [node2-data:/data]
     ports: ["8002:8000"]
 
   storage-node-3:
     <<: *storage-node
-    environment: { <<: *node-env, NODE_ID: storage-node-3 }
+    environment: { <<: *node-env, NODE_ID: storage-node-3, NODE_PUBLIC_URL: "http://127.0.0.1:8003" }
     volumes: [node3-data:/data]
     ports: ["8003:8000"]
 
   storage-node-4:
     <<: *storage-node
-    environment: { <<: *node-env, NODE_ID: storage-node-4 }
+    environment: { <<: *node-env, NODE_ID: storage-node-4, NODE_PUBLIC_URL: "http://127.0.0.1:8004" }
     volumes: [node4-data:/data]
     ports: ["8004:8000"]
+
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: dos
+      POSTGRES_PASSWORD: dos
+      POSTGRES_DB: dos
+    volumes: [pg-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "dos", "-d", "dos"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  metadata:
+    build: { context: ., dockerfile: metadata/Dockerfile }
+    image: dos/metadata:latest
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://dos:dos@postgres:5432/dos
+      REPLICAS: "3"          # copies of every chunk
+      RING_VNODES: "128"     # virtual nodes per storage node on the hash ring
+      NODE_TIMEOUT: "15"     # seconds without a heartbeat before a node counts as down
+    depends_on:
+      postgres: { condition: service_healthy }
+    ports: ["9000:8000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
 
 volumes:
   node1-data:
   node2-data:
   node3-data:
   node4-data:
+  pg-data:

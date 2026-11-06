@@ -1,0 +1,5 @@
+scenario,method,copies_moved_pct,chunks_affected_pct,primary_moved_pct,ideal_pct
+add node (4 -> 5),consistent hashing ring,20.1,60.2,20.8,20.0
+add node (4 -> 5),modulo (hash mod n),39.8,90.1,79.3,20.0
+remove node (5 -> 4),consistent hashing ring,18.2,54.5,20.9,20.0
+remove node (5 -> 4),modulo (hash mod n),40.4,90.7,80.8,20.0

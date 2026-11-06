@@ -84,14 +84,14 @@ class ChunkStore:
         }
 
 
-async def heartbeat_loop(store: ChunkStore, node_id: str, node_url: str, metadata_url: str, interval: float):
+async def heartbeat_loop(store: ChunkStore, node: dict, metadata_url: str, interval: float):
     healthy = None
     async with httpx.AsyncClient(timeout=interval) as client:
         while True:
             stats = await asyncio.to_thread(store.stats)
             error = None
             try:
-                r = await client.post(f"{metadata_url}/heartbeat", json={"node_id": node_id, "url": node_url, **stats})
+                r = await client.post(f"{metadata_url}/heartbeat", json={**node, **stats})
                 r.raise_for_status()
             except httpx.HTTPError as e:
                 error = e
@@ -109,6 +109,7 @@ def create_app() -> FastAPI:
     logging.basicConfig(level=logging.INFO)
     node_id = os.environ.get("NODE_ID", "storage-node-local")
     node_url = os.environ.get("NODE_URL", f"http://{node_id}:8000")
+    public_url = os.environ.get("NODE_PUBLIC_URL")  # how clients outside Docker reach this node
     metadata_url = os.environ.get("METADATA_URL")  # unset = no heartbeats
     interval = float(os.environ.get("HEARTBEAT_INTERVAL", "5"))
     store = ChunkStore(Path(os.environ.get("DATA_DIR", "./data")))
@@ -117,7 +118,8 @@ def create_app() -> FastAPI:
     async def lifespan(app: FastAPI):
         task = None
         if metadata_url:
-            task = asyncio.create_task(heartbeat_loop(store, node_id, node_url, metadata_url, interval))
+            node = {"node_id": node_id, "url": node_url, "public_url": public_url}
+            task = asyncio.create_task(heartbeat_loop(store, node, metadata_url, interval))
         yield
         if task:
             task.cancel()
