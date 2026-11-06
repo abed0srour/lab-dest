@@ -7,3 +7,7 @@ __pycache__/
 # Local chunk storage and generated test datasets (regenerate with the scripts)
 data/
 datasets/
+
+# UI dependencies and build output (npm install / npm run build recreate them)
+ui/node_modules/
+ui/dist/

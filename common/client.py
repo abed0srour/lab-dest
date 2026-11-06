@@ -122,9 +122,11 @@ class StorageClient:
     def list_buckets(self) -> list[dict]:
         return self._meta("GET", "/buckets")
 
-    def search(self, **filters) -> dict:
-        """Filters: bucket, prefix, min_size, max_size, after, before, tag (list of "key=value"), limit."""
-        return self._meta("GET", "/search", params={k: v for k, v in filters.items() if v not in (None, "", [])})
+    def search(self, engine: str = "postgres", **filters) -> dict:
+        """Filters: bucket, prefix, min_size, max_size, after, before, tag (list of "key=value"), limit,
+        and q (free text, Elasticsearch only)."""
+        path = "/search/es" if engine == "elasticsearch" else "/search"
+        return self._meta("GET", path, params={k: v for k, v in filters.items() if v not in (None, "", [])})
 
     # ---- write path ----------------------------------------------------------
 

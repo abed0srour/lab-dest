@@ -160,6 +160,7 @@ def object_headers(meta: dict) -> dict[str, str]:
 
 def create_app() -> FastAPI:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     storage = StorageClient(os.environ.get("METADATA_URL", "http://metadata:8000"), public=False)
     keys = ApiKeys(os.environ.get("API_KEYS", "student-key-2026:student:200"))
     gateway_id = os.environ.get("GATEWAY_ID", socket.gethostname())
@@ -298,11 +299,27 @@ def create_app() -> FastAPI:
     def search(bucket: str | None = None, prefix: str = "", min_size: int | None = None,
                max_size: int | None = None, after: datetime | None = None, before: datetime | None = None,
                tag: Annotated[list[str], Query(description="key=value, repeat for several")] = [],
+               q: Annotated[str | None, Query(description="free text (Elasticsearch only)")] = None,
+               engine: Literal["postgres", "elasticsearch"] = "postgres",
                limit: int = Query(100, ge=1, le=10000)):
-        """Find objects by key prefix, size (bytes), creation date (ISO, e.g. 2026-11-06) and tags."""
-        return storage.search(bucket=bucket, prefix=prefix, min_size=min_size, max_size=max_size,
+        """Find objects by key prefix, size (bytes), creation date (ISO, e.g. 2026-11-06) and tags.
+        `engine=elasticsearch` also takes free text `q` (words or any part of a key, typos allowed)
+        and returns facet counts. Elasticsearch shows new uploads after about a second."""
+        if q and engine == "postgres":
+            raise HTTPException(400, "free-text search (q) needs engine=elasticsearch")
+        return storage.search(engine, bucket=bucket, prefix=prefix, min_size=min_size, max_size=max_size,
                               after=after.isoformat() if after else None,
-                              before=before.isoformat() if before else None, tag=tag, limit=limit)
+                              before=before.isoformat() if before else None, tag=tag, q=q, limit=limit)
+
+    @api.get("/search/status", tags=["search"])
+    def search_status():
+        """Elasticsearch health and how many objects are indexed."""
+        return storage._meta("GET", "/search/status")
+
+    @api.post("/search/reindex", tags=["search"])
+    def search_reindex():
+        """Rebuild the Elasticsearch index from the metadata database."""
+        return storage._meta("POST", "/search/reindex")
 
     @api.get("/cluster/status", tags=["status"])
     def cluster_status():
@@ -316,6 +333,16 @@ def create_app() -> FastAPI:
                             "failed": h["nodes"]["failed"], "free_bytes": sum(n["free_bytes"] for n in nodes)},
                 "objects": h["objects"], "chunks": h["chunks"], "repair_jobs": h["repair_jobs"],
                 "settings": h["settings"]}
+
+    @api.get("/cluster/repairs", tags=["status"])
+    def cluster_repairs(bucket: str | None = None, since_id: int = 0):
+        """Repair jobs and repair traffic (bytes read and written) per redundancy scheme."""
+        return storage.repair_stats(bucket, since_id)
+
+    @api.post("/cluster/scrub", tags=["status"])
+    def cluster_scrub():
+        """Re-check every stored chunk on every node now; bad copies are repaired."""
+        return storage.scrub()
 
     app.include_router(api)
     return app

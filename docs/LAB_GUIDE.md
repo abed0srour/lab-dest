@@ -19,8 +19,8 @@ At the end you will find the **3 flowcharts** the report needs, a **Word report 
 | 3 | Metadata and placement | ✅ Done |
 | 4 | Redundancy and recovery | ✅ Done |
 | 5 | API gateway | ✅ Done |
-| 6 | Web UI + Elasticsearch search | ⬜ Next |
-| 7 | Load balancing and fault tolerance (bonus) | ⬜ |
+| 6 | Web UI + Elasticsearch search | ✅ Done |
+| 7 | Load balancing and fault tolerance (bonus) | ⬜ Next |
 | 8 | Cloud deployment (bonus) | ⬜ |
 
 ---
@@ -413,25 +413,34 @@ Small files are limited by requests (each upload means about 6 internal requests
 
 **Goal:** a browser interface for files and cluster health, and search backed by Elasticsearch.
 
-**What gets built:**
+**What was built:**
 
-- A React app (Vite) in `ui/` with three pages:
-  - **Browser:** buckets and objects, upload with a progress bar, download, delete.
-  - **Search:** prefix, size, date and tag filters, answered by Elasticsearch.
-  - **Cluster:** a health card per node, a chunks-per-node chart, and a repair progress bar.
-- A single-node Elasticsearch in `docker-compose.yml`. The metadata service indexes every upload and delete.
-- ⚠️ `npm install` plus the Elasticsearch image download about 1 GB in total, so do this phase on a fast connection.
+| Part | What it does |
+|---|---|
+| **React app** ([ui/src/](../ui/src/)), React 19 + Vite | Three pages: **Files**, **Search** and **Cluster**, with an API key box in the header. No UI library, just plain CSS with light and dark themes |
+| **Files page** | Buckets list and "new bucket" (replication or EC). Drag-and-drop upload with folder, tags and chunking, and a progress bar per file. Object list with prefix filter. Download with progress, details (SHA-256, chunks, which nodes hold each chunk), delete |
+| **Search page** | Free text (words, typos, any part of a key), bucket, prefix, size, date and tag filters. Facets (buckets, tags, content types) you can click. A switch to compare Elasticsearch with PostgreSQL |
+| **Cluster page** | Refreshes every 2 s. Summary tiles (nodes, objects, degraded, unreadable, repair queue, free space, search index), a bar chart of chunks per node, a repair progress bar with repair traffic per scheme, a "Scrub now" button, node health (alive / no heartbeat / failed), chunk health per scheme |
+| **Elasticsearch 9.2** | A single node in Docker, port 9200. The metadata service sends every commit and delete to the `objects` index in the background, in batches (bulk API), and rebuilds it from PostgreSQL if it's empty or behind ([metadata/search_index.py](../metadata/search_index.py)) |
+| **nginx** ([ui/nginx.conf](../ui/nginx.conf)) | Serves the built app on port **5173** and forwards `/api/` to the gateway, with streaming for large uploads and downloads (no buffering, no size limit) |
+| [scripts/seed_ui_data.py](../scripts/seed_ui_data.py), [scripts/demo_phase6.ps1](../scripts/demo_phase6.ps1) | Sample data for the screenshots (2,000 tagged files + 2 disk images), the Elasticsearch check, and a live node failure |
+| `tests/test_search_es.py` | 8 search tests (56 in total) |
+
+To work on the UI with live reload instead of Docker: `cd ui`, `npm install`, `npm run dev`. Vite forwards `/api` to the gateway the same way.
 
 | Fig | Screenshot | How to show it |
 |---|---|---|
-| 6.1 | Bucket and object browser | http://localhost:5173 |
-| 6.2 | Uploading a file (progress bar) | UI |
-| 6.3 | Downloading a file | UI + the file in `Downloads` |
-| 6.4 | Search page with filters and results | UI |
-| 6.5 | The data really is in Elasticsearch | `curl.exe "http://localhost:9200/objects/_search?q=key:report*"` |
-| 6.6 | Cluster dashboard, all healthy, chunk distribution chart | UI |
-| 6.7 | Dashboard during a failure: node red, repair progress moving | Stop a node, then watch the UI |
-| 6.8 | Dashboard after repair: 0 degraded objects | UI |
+| 6.1 | Files page: buckets and object list | http://127.0.0.1:5173 → Files → bucket `docs` |
+| 6.2 | Uploading files with tags (progress bar) | Files → drop files → tags → Upload |
+| 6.3 | Object details: SHA-256, chunks and their nodes | Files → **Details** on an object (try one in `archive` too, to see the fragments) |
+| 6.4 | Downloading a file (progress, then the file in Downloads) | Files → **Download** |
+| 6.5 | Free-text search with facets | Search → type `user` (or a typo like `ordr`) |
+| 6.6 | Search with filters (size, tag, date) | Search → tags `type=disk-image`, min size `100000` KB |
+| 6.7 | The metadata really is in Elasticsearch | Demo step 2 (`_count` + a direct query on port 9200) |
+| 6.8 | Cluster page, healthy | Cluster |
+| 6.9 | Cluster page during a failure: node "No heartbeat", then "Failed", repair progress moving | Demo step 3 kills storage-node-4 |
+| 6.10 | Cluster page after the repair: 0 degraded | Cluster, when the repair finishes |
+| 6.11 | All tests pass | `.\.venv\Scripts\python.exe -m pytest -v` |
 
 **In the report, explain:**
 

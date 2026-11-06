@@ -25,6 +25,7 @@ from pydantic import BaseModel, Field
 
 from common.db import CHUNK_STATES, SCHEMA, alive_nodes, enqueue_repair, report_bad_copy
 from common.ring import HashRing
+from metadata.search_index import SearchIndex
 
 log = logging.getLogger("metadata")
 
@@ -107,12 +108,14 @@ def like_prefix(prefix: str) -> str:
 
 def create_app() -> FastAPI:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.getLogger("httpx").setLevel(logging.WARNING)  # no line per request to nodes / Elasticsearch
     cfg = Settings()
     pool = ConnectionPool(
         os.environ.get("DATABASE_URL", "postgresql://dos:dos@localhost:5432/dos"),
         min_size=2, max_size=20, open=False, kwargs={"row_factory": dict_row},
     )
     stop = threading.Event()
+    index = SearchIndex(pool, os.environ.get("ES_URL", "http://elasticsearch:9200"))
 
     def failure_detector():
         """Mark nodes that stopped sending heartbeats as failed and queue repairs for their chunks."""
@@ -146,6 +149,7 @@ def create_app() -> FastAPI:
                  cfg.node_timeout)
         detector = threading.Thread(target=failure_detector, daemon=True)
         detector.start()
+        index.start()
         yield
         stop.set()
         pool.close()
@@ -316,6 +320,7 @@ def create_app() -> FastAPI:
                     """INSERT INTO object_chunks (object_id, seq, chunk_hash, redundancy, offset_bytes)
                        VALUES (%s, %s, %s, %s, %s)""", rows)
 
+        index.touch(bucket, key)
         return {"bucket": bucket, "key": key, "version": version, "size": body.size, "redundancy": redundancy,
                 "sha256": body.sha256, "content_type": body.content_type, "tags": body.tags,
                 "created_at": obj["created_at"], "chunks": len(body.chunks), "new_chunks": new,
@@ -366,7 +371,36 @@ def create_app() -> FastAPI:
                    ORDER BY bucket, key LIMIT %(limit)s""",
                 {"bucket": bucket, "prefix": like_prefix(prefix), "min": min_size, "max": max_size,
                  "after": after, "before": before, "tags": Jsonb(tags), "limit": limit}).fetchall()
-        return {"count": len(rows), "results": rows}
+        return {"engine": "postgres", "count": len(rows), "results": rows}
+
+    @app.get("/search/es")
+    def search_es(q: str | None = None, bucket: str | None = None, prefix: str = "",
+                  min_size: int | None = None, max_size: int | None = None, after: datetime | None = None,
+                  before: datetime | None = None, tag: Annotated[list[str], Query()] = [],
+                  limit: int = Query(100, ge=1, le=10000)):
+        """Full-text search in Elasticsearch: `q` matches words or any part of the key (typos allowed)
+        or an exact tag; the other filters work like /search. Also returns facet counts."""
+        try:
+            tags = dict(t.split("=", 1) for t in tag)
+        except ValueError:
+            raise HTTPException(400, "tag filters look like tag=type=video")
+        try:
+            return index.search(q, bucket, prefix, min_size, max_size, after.isoformat() if after else None,
+                                before.isoformat() if before else None, tags, limit)
+        except httpx.HTTPError as e:
+            raise HTTPException(503, f"Elasticsearch is not available: {e!r}")
+
+    @app.get("/search/status")
+    def search_status():
+        return index.status()
+
+    @app.post("/search/reindex")
+    def search_reindex():
+        """Rebuild the Elasticsearch index from PostgreSQL."""
+        try:
+            return {"reindexed": index.reindex()}
+        except httpx.HTTPError as e:
+            raise HTTPException(503, f"Elasticsearch is not available: {e!r}")
 
     @app.get("/buckets/{bucket}/objects/{key:path}")
     def get_object(bucket: str, key: str, version: int | None = None):
@@ -436,6 +470,7 @@ def create_app() -> FastAPI:
                     "SELECT blob_hash, node_id FROM chunk_locations WHERE blob_hash = ANY(%s)",
                     ([g["blob_hash"] for g in garbage],))}
 
+        index.touch(bucket, key)
         # Remove the unreferenced blobs from the nodes after the commit (best effort: blobs on failed
         # nodes stay as orphans until those nodes are cleaned).
         removed = 0

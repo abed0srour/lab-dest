@@ -81,6 +81,22 @@ services:
       timeout: 3s
       retries: 10
 
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.2.0
+    restart: unless-stopped
+    environment:
+      discovery.type: single-node                 # one node, no cluster bootstrap checks
+      xpack.security.enabled: "false"             # local development: plain HTTP, no passwords
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+      cluster.routing.allocation.disk.threshold_enabled: "false"
+    volumes: [es-data:/usr/share/elasticsearch/data]
+    ports: ["9200:9200"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -vq '\"status\":\"red\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
   metadata:
     build: { context: ., dockerfile: metadata/Dockerfile }
     image: dos/metadata:latest
@@ -88,6 +104,7 @@ services:
     environment:
       <<: *redundancy
       DATABASE_URL: postgresql://dos:dos@postgres:5432/dos
+      ES_URL: http://elasticsearch:9200   # object metadata is also indexed here for search
       NODE_TIMEOUT: "15"            # seconds without a heartbeat (3 missed beats) before a node is FAILED
       FAILURE_CHECK_INTERVAL: "2"
     depends_on:
@@ -118,6 +135,13 @@ services:
       timeout: 3s
       retries: 3
 
+  ui:
+    build: ./ui
+    image: dos/ui:latest
+    restart: unless-stopped
+    depends_on: [gateway]
+    ports: ["5173:80"]   # http://127.0.0.1:5173
+
   repair-worker:
     build: { context: ., dockerfile: repair_worker/Dockerfile }
     image: dos/repair-worker:latest
@@ -140,3 +164,4 @@ volumes:
   node6-data:
   node7-data:
   pg-data:
+  es-data:
