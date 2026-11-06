@@ -77,6 +77,17 @@ class ChunkStore:
     def hashes(self) -> list[str]:
         return [p.name for p in self.chunks.glob("*/*/*")]
 
+    def scrub(self) -> dict:
+        """Re-read every stored chunk and return the ones whose content no longer matches their name."""
+        corrupted, checked, size = [], 0, 0
+        for p in self.chunks.glob("*/*/*"):
+            data = p.read_bytes()
+            checked += 1
+            size += len(data)
+            if sha256(data) != p.name:
+                corrupted.append(p.name)
+        return {"checked": checked, "bytes": size, "corrupted": corrupted}
+
     def stats(self) -> dict:
         return {
             "free_bytes": shutil.disk_usage(self.root).free,
@@ -161,6 +172,13 @@ def create_app() -> FastAPI:
     @app.get("/chunks")
     async def list_chunks():
         return {"node_id": node_id, "chunks": await asyncio.to_thread(store.hashes)}
+
+    @app.post("/scrub")
+    async def scrub():
+        result = await asyncio.to_thread(store.scrub)
+        if result["corrupted"]:
+            log.error("scrub found %d corrupted chunks", len(result["corrupted"]))
+        return {"node_id": node_id, **result}
 
     @app.get("/health")
     async def health():

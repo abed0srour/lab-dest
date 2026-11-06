@@ -1,3 +1,4 @@
 -r storage_node/requirements.txt
 fastcdc>=1.5
+zfec>=1.5
 pytest>=8

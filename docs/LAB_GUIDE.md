@@ -17,8 +17,8 @@ At the end you will find the **3 flowcharts** the report needs, a **Word report 
 | 1 | Set up the environment | ✅ Done |
 | 2 | Storage node module | ✅ Done |
 | 3 | Metadata and placement | ✅ Done |
-| 4 | Redundancy and recovery | ⬜ Next |
-| 5 | API gateway | ⬜ |
+| 4 | Redundancy and recovery | ✅ Done |
+| 5 | API gateway | ⬜ Next |
 | 6 | Web UI + Elasticsearch search | ⬜ |
 | 7 | Load balancing and fault tolerance (bonus) | ⬜ |
 | 8 | Cloud deployment (bonus) | ⬜ |
@@ -61,7 +61,7 @@ flowchart LR
     G1 & G2 --> M[Metadata service]
     M --> PG[(PostgreSQL)]
     M --> ES[(Elasticsearch)]
-    G1 & G2 --> SN[Storage nodes 1-6<br/>each with its own volume]
+    G1 & G2 --> SN[Storage nodes 1-7<br/>each with its own volume]
     SN -- heartbeat every 5 s --> M
     M -- repair / rebalance / GC jobs --> Q[[RabbitMQ - bonus]]
     Q --> W[Repair workers]
@@ -71,7 +71,7 @@ flowchart LR
 
 | Service | Folder | Built in | Job |
 |---|---|---|---|
-| storage-node (4, then 6) | `storage_node/` | Phase 2 | Stores chunks named by their SHA-256 on its own volume, checks the hash on every read, sends heartbeats |
+| storage-node (4, then 7) | `storage_node/` | Phase 2 | Stores chunks named by their SHA-256 on its own volume, checks the hash on every read, sends heartbeats |
 | metadata | `metadata/` | Phase 3 | PostgreSQL tables for buckets, objects, chunk lists, reference counts and nodes. Runs the consistent hashing ring and detects failed nodes |
 | repair-worker | `repair_worker/` | Phase 4 | Rebuilds lost chunks, runs the scrubber, rebalances data, garbage-collects unused chunks |
 | gateway | `gateway/` | Phase 5 | S3-like REST API, authentication, rate limiting, chunking, quorum, erasure coding |
@@ -81,7 +81,7 @@ flowchart LR
 
 Code used by several services (chunking, hash ring, erasure coding) goes in `common/`.
 
-**Ports on your PC:** storage nodes `8001`–`8006`, gateway `8080`, metadata `9000`, UI `5173`, Elasticsearch `9200`, RabbitMQ admin `15672`, Prometheus `9090`, Grafana `3000`.
+**Ports on your PC:** storage nodes `8001`–`8007`, gateway `8080`, metadata `9000`, UI `5173`, Elasticsearch `9200`, RabbitMQ admin `15672`, Prometheus `9090`, Grafana `3000`.
 
 ### Project folders
 
@@ -273,40 +273,64 @@ powershell -ExecutionPolicy Bypass -File scripts\demo_phase3.ps1
 
 **Goal:** keep data available when nodes fail or disks corrupt data.
 
-**What gets built:**
+**What was built:**
 
-1. **Replication** with N = 3 copies, write quorum W = 2, read quorum R = 2, all configurable. Because W + R = 4 > N = 3, every read overlaps at least one node from the latest write.
-2. **Erasure coding** with Reed–Solomon 4 + 2 using `zfec`, chosen per bucket (a bucket is created with `redundancy=ec`).
-3. **Scale to 6 storage nodes**, so each of the 6 fragments lands on a different node. With only 4 nodes, two nodes would hold 2 fragments each, and losing one of them would lose 2 fragments at once.
-4. **Failure detection.** A node with no heartbeat for 15 s (3 missed beats) is marked **FAILED** and removed from the ring.
-5. **Repair worker:**
-   - Finds every chunk that had a copy on the failed node.
-   - Marks those objects as degraded.
-   - Rebuilds each copy on another node:
-     - replication: copy from a surviving replica;
-     - erasure coding: read any 4 fragments and rebuild the missing one.
-6. **Scrubber.** On a schedule, it re-reads every chunk. A chunk with the wrong hash (bit rot) is replaced from a healthy copy.
-7. **Benchmark**, `scripts/bench_redundancy.py`: storage overhead and repair traffic for both schemes on both workloads.
+| Part | What it does |
+|---|---|
+| **Quorum replication** | N = 3 copies, written in parallel. The upload succeeds once **W = 2** are stored; reads ask **R = 2** replicas (GET one, HEAD one). W + R = 4 > N = 3, so the replicas a reader asks always include one that acknowledged the write. The metadata service refuses to start if W + R ≤ N |
+| **Erasure coding** ([common/erasure.py](../common/erasure.py)) | Reed–Solomon with `zfec`: each chunk becomes 4 data + 2 parity fragments on 6 different nodes, and any 4 rebuild it. An upload needs 5 of the 6. Chosen per bucket: `cli.py mb NAME --redundancy ec` |
+| **7 storage nodes** | 6 for the fragments of a chunk, plus one spare so a lost fragment can be rebuilt on a node that does not already hold another fragment of the same chunk |
+| **Failure detection** ([metadata/app.py](../metadata/app.py)) | Every 2 s, a node without a heartbeat for 15 s (3 missed beats) is marked **FAILED**, removed from the ring, and one repair job is queued per chunk it held. A node that comes back rejoins and is scrubbed |
+| **Repair worker** ([repair_worker/worker.py](../repair_worker/worker.py)) | 8 threads take jobs from a PostgreSQL queue. Replication: copy a healthy replica to the next node on the ring. Erasure coding: read 4 fragments, decode, re-encode the missing one. Every job records the bytes it read and wrote |
+| **Scrubber** | Each node re-hashes all its blobs (`POST /scrub`); corrupted or missing ones are recorded as bad copies and repaired from a healthy copy. Runs every 10 minutes, or now with `cli.py scrub` |
+| **Sweep** | Every 30 s, any chunk still below full redundancy without a repair job gets one |
+| **Read path** | A replica or fragment that is missing or fails its hash check is reported to the metadata service and repaired; the read carries on with another copy |
+| [scripts/demo_phase4.ps1](../scripts/demo_phase4.ps1) | The whole Phase 4 demo in 8 steps, pausing after each one for a screenshot |
+| [scripts/bench_redundancy.py](../scripts/bench_redundancy.py) | Replication vs erasure coding on both workloads: storage overhead, then kills a node and measures repair traffic |
+| `tests/test_erasure.py`, `tests/test_cluster.py` | 10 new tests (32 in total) |
 
-**Results to expect:**
+**Measured in the demo** (216 MB file in each scheme, `storage-node-3` killed):
 
 | | Replication (3 copies) | Erasure coding (4 + 2) |
 |---|---|---|
-| Storage overhead | 3.0× | 1.5× |
-| Failures survived | 2 | 2 |
-| Data read to rebuild one lost piece | 1 copy (1× its size) | 4 fragments (4× the fragment size) |
-| Small files | Fine | Each tiny file becomes 6 tiny fragments, so many more requests and metadata rows |
+| Stored on the nodes | 648 MB (3.00×) in 162 blobs | 324 MB (1.50×) in 324 blobs |
+| Failure detected after | 14–17 s | 14–17 s |
+| Repair: chunks rebuilt | 22 | 53 |
+| Repair: read / written | 88 MB / 88 MB (1×) | 212 MB / 53 MB (4×) |
+| Repair time | about 2 s | about 2 s |
+| Node failures survived | 2 | 2 (with 3 down, a chunk had only 3 of 4 fragments) |
+
+**Benchmark** (`bench_redundancy.py`: both workloads, then `storage-node-1` killed while holding 6,203 blobs; FAILED after 13.6 s, fully repaired after 104 s):
+
+| Workload | Scheme | Stored / unique | Blobs | Chunks rebuilt | Repair read | Repair written |
+|---|---|---|---|---|---|---|
+| Small (5,000 files, 108 MB unique) | Replication | 3.0× | 13,383 | 2,027 | 49.2 MB | 49.2 MB |
+| Small | EC 4 + 2 | 1.5× | 26,766 | 3,939 | 95.3 MB | 23.8 MB |
+| Large (4 images, 720 MB) | Replication | 3.0× | 546 | 81 | 319 MB | 319 MB |
+| Large | EC 4 + 2 | 1.5× | 1,092 | 156 | 619 MB | 154.8 MB |
+
+**Check it works:**
+
+```powershell
+docker compose down -v ; docker compose up -d --build
+.\.venv\Scripts\python.exe -m pytest -v
+powershell -ExecutionPolicy Bypass -File scripts\demo_phase4.ps1
+.\.venv\Scripts\python.exe scripts\bench_redundancy.py
+```
 
 | Fig | Screenshot | How to show it |
 |---|---|---|
-| 4.1 | 6 nodes running; one replicated bucket and one EC bucket | `docker compose ps` + bucket list |
-| 4.2 | Quorum: upload succeeds with 1 of a chunk's 3 nodes down, fails with 2 down | Quorum demo script |
-| 4.3 | Failed node detected | `docker compose stop storage-node-3`, wait 15 s, then `/nodes` shows FAILED |
-| 4.4 | Repair running and finished | `docker compose logs -f repair-worker`, until degraded objects reach 0 |
-| 4.5 | Data still correct after the failure | Download, then `Get-FileHash` matches the original |
-| 4.6 | EC object readable with 2 nodes down, fails with 3 down (before repair) | Stop nodes one at a time and download |
-| 4.7 | Scrubber fixes bit rot | Corrupt a chunk on disk, then the scrubber log shows it detected and repaired |
-| 4.8 | Replication vs EC on both workloads | `bench_redundancy.py` table |
+| 4.1 | 7 nodes running + the repair worker | `docker compose ps` |
+| 4.2 | Cluster settings and node health | Demo step 1 |
+| 4.3 | Same file in both schemes: 3.00× vs 1.50×; 6 fragments on 6 nodes | Demo step 2 |
+| 4.4 | Quorum write: OK with 1 node down, refused with 2 down | Demo step 3 |
+| 4.5 | Node killed → FAILED after ~15 s → repaired; repair traffic table | Demo step 4 |
+| 4.6 | Both downloads match the original SHA-256 after the failure | Demo step 5 |
+| 4.7 | EC survives 2 dead nodes, not 3 | Demo step 6 |
+| 4.8 | Scrubber finds the corrupted copy and repairs it (409 → 200) | Demo step 7 |
+| 4.9 | Failure detection and repair in the logs | `docker compose logs metadata --since 15m \| Select-String "FAILED\|is back" -CaseSensitive`, then `docker compose logs repair-worker --since 15m \| Select-String "repaired chunk\|scrubbed" \| Select-Object -First 12` |
+| 4.10 | Replication vs EC on both workloads | `.\.venv\Scripts\python.exe scripts\bench_redundancy.py` |
+| 4.11 | All tests pass | `.\.venv\Scripts\python.exe -m pytest -v` |
 
 **In the report, explain:**
 

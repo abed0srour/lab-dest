@@ -1,0 +1,5 @@
+workload,redundancy,files,unique_mb,stored_mb,overhead,blobs,upload_s,repairs,repair_read_mb,repair_written_mb,read_per_written
+small,replication,5000,108.3,324.8,3.0,13383,52.6,2027,49.2,49.2,1.0
+small,ec,5000,108.3,162.4,1.5,26766,65.4,3939,95.3,23.8,4.0
+large,replication,4,720.0,2160.0,3.0,546,15.4,81,319.0,319.0,1.0
+large,ec,4,720.0,1080.0,1.5,1092,10.0,156,619.0,154.8,4.0

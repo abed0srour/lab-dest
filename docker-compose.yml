@@ -12,7 +12,19 @@ x-node-env: &node-env
   METADATA_URL: http://metadata:8000
   HEARTBEAT_INTERVAL: "5"
 
+# Redundancy settings, shared by the metadata service and the repair worker.
+x-redundancy: &redundancy
+  REPLICAS: "3"          # N: copies of every chunk in replicated buckets
+  WRITE_QUORUM: "2"      # W: copies that must be stored before an upload succeeds
+  READ_QUORUM: "2"       # R: replicas asked on every read (W + R > N)
+  EC_K: "4"              # erasure-coded buckets: 4 data fragments ...
+  EC_M: "2"              # ... + 2 parity fragments, any 4 of the 6 rebuild the chunk
+  EC_WRITE_QUORUM: "5"   # fragments that must be stored before an upload succeeds
+  RING_VNODES: "128"     # virtual nodes per storage node on the hash ring
+
 services:
+  # 7 storage nodes: 6 for the 4 + 2 fragments of a chunk, plus one spare so a lost
+  # fragment can be rebuilt on a node that does not already hold one of the others.
   storage-node-1:
     <<: *storage-node
     environment: { <<: *node-env, NODE_ID: storage-node-1, NODE_PUBLIC_URL: "http://127.0.0.1:8001" }
@@ -37,6 +49,24 @@ services:
     volumes: [node4-data:/data]
     ports: ["8004:8000"]
 
+  storage-node-5:
+    <<: *storage-node
+    environment: { <<: *node-env, NODE_ID: storage-node-5, NODE_PUBLIC_URL: "http://127.0.0.1:8005" }
+    volumes: [node5-data:/data]
+    ports: ["8005:8000"]
+
+  storage-node-6:
+    <<: *storage-node
+    environment: { <<: *node-env, NODE_ID: storage-node-6, NODE_PUBLIC_URL: "http://127.0.0.1:8006" }
+    volumes: [node6-data:/data]
+    ports: ["8006:8000"]
+
+  storage-node-7:
+    <<: *storage-node
+    environment: { <<: *node-env, NODE_ID: storage-node-7, NODE_PUBLIC_URL: "http://127.0.0.1:8007" }
+    volumes: [node7-data:/data]
+    ports: ["8007:8000"]
+
   postgres:
     image: postgres:17-alpine
     restart: unless-stopped
@@ -56,10 +86,10 @@ services:
     image: dos/metadata:latest
     restart: unless-stopped
     environment:
+      <<: *redundancy
       DATABASE_URL: postgresql://dos:dos@postgres:5432/dos
-      REPLICAS: "3"          # copies of every chunk
-      RING_VNODES: "128"     # virtual nodes per storage node on the hash ring
-      NODE_TIMEOUT: "15"     # seconds without a heartbeat before a node counts as down
+      NODE_TIMEOUT: "15"            # seconds without a heartbeat (3 missed beats) before a node is FAILED
+      FAILURE_CHECK_INTERVAL: "2"
     depends_on:
       postgres: { condition: service_healthy }
     ports: ["9000:8000"]
@@ -69,9 +99,25 @@ services:
       timeout: 3s
       retries: 3
 
+  repair-worker:
+    build: { context: ., dockerfile: repair_worker/Dockerfile }
+    image: dos/repair-worker:latest
+    restart: unless-stopped
+    environment:
+      <<: *redundancy
+      DATABASE_URL: postgresql://dos:dos@postgres:5432/dos
+      WORKER_THREADS: "8"
+      SCRUB_INTERVAL: "600"         # scrub every node every 10 minutes (python scripts/cli.py scrub runs it now)
+      SWEEP_INTERVAL: "30"          # look for degraded chunks without a repair job
+    depends_on:
+      metadata: { condition: service_healthy }
+
 volumes:
   node1-data:
   node2-data:
   node3-data:
   node4-data:
+  node5-data:
+  node6-data:
+  node7-data:
   pg-data:
