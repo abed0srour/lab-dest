@@ -1,0 +1,2 @@
+-r storage_node/requirements.txt
+pytest>=8

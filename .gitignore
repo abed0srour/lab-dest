@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+
+# Local chunk storage and generated test datasets (regenerate with the scripts)
+data/
+datasets/

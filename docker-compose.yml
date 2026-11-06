@@ -1,0 +1,44 @@
+x-storage-node: &storage-node
+  build: ./storage_node
+  image: dos/storage-node:latest
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+    interval: 10s
+    timeout: 3s
+    retries: 3
+
+x-node-env: &node-env
+  METADATA_URL: http://metadata:8000
+  HEARTBEAT_INTERVAL: "5"
+
+services:
+  storage-node-1:
+    <<: *storage-node
+    environment: { <<: *node-env, NODE_ID: storage-node-1 }
+    volumes: [node1-data:/data]
+    ports: ["8001:8000"]
+
+  storage-node-2:
+    <<: *storage-node
+    environment: { <<: *node-env, NODE_ID: storage-node-2 }
+    volumes: [node2-data:/data]
+    ports: ["8002:8000"]
+
+  storage-node-3:
+    <<: *storage-node
+    environment: { <<: *node-env, NODE_ID: storage-node-3 }
+    volumes: [node3-data:/data]
+    ports: ["8003:8000"]
+
+  storage-node-4:
+    <<: *storage-node
+    environment: { <<: *node-env, NODE_ID: storage-node-4 }
+    volumes: [node4-data:/data]
+    ports: ["8004:8000"]
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
+  node4-data:
