@@ -10,6 +10,7 @@ import logging
 import os
 import shutil
 import tempfile
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated
@@ -17,6 +18,10 @@ from typing import Annotated
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi import Path as PathParam
+from prometheus_client import CollectorRegistry
+from prometheus_client.core import GaugeMetricFamily
+
+from common.metrics import MetricsMiddleware, metrics_response
 
 log = logging.getLogger("storage_node")
 
@@ -74,8 +79,17 @@ class ChunkStore:
         except FileNotFoundError:
             return False
 
-    def hashes(self) -> list[str]:
-        return [p.name for p in self.chunks.glob("*/*/*")]
+    def hashes(self, older_than: float | None = None) -> list[str]:
+        """Every stored chunk, or only those written more than `older_than` seconds ago."""
+        if older_than is None:
+            return [p.name for p in self.chunks.glob("*/*/*")]
+        cutoff = time.time() - older_than
+        return [p.name for p in self.chunks.glob("*/*/*") if p.stat().st_mtime < cutoff]
+
+    def usage(self) -> tuple[int, int]:
+        """(number of chunks, bytes they take)."""
+        sizes = [p.stat().st_size for p in self.chunks.glob("*/*/*")]
+        return len(sizes), sum(sizes)
 
     def scrub(self) -> dict:
         """Re-read every stored chunk and return the ones whose content no longer matches their name."""
@@ -136,6 +150,23 @@ def create_app() -> FastAPI:
             task.cancel()
 
     app = FastAPI(title=f"Storage node {node_id}", lifespan=lifespan)
+    app.add_middleware(MetricsMiddleware, service="storage-node")
+
+    class DiskCollector:
+        """Disk usage gauges, measured when Prometheus scrapes."""
+
+        def collect(self):
+            blobs, stored = store.usage()
+            for name, help_, value in (
+                    ("dos_node_blobs", "Blobs (replicas and fragments) stored on this node", blobs),
+                    ("dos_node_stored_bytes", "Bytes stored on this node", stored),
+                    ("dos_node_free_bytes", "Free disk space on this node", shutil.disk_usage(store.root).free)):
+                g = GaugeMetricFamily(name, help_, labels=["node"])
+                g.add_metric([node_id], value)
+                yield g
+
+    registry = CollectorRegistry()
+    registry.register(DiskCollector())
 
     @app.put("/chunks/{h}", status_code=201)
     async def put_chunk(h: ChunkHash, request: Request, response: Response):
@@ -165,13 +196,20 @@ def create_app() -> FastAPI:
         return Response(headers={"Content-Length": str(size)})
 
     @app.delete("/chunks/{h}", status_code=204)
-    async def delete_chunk(h: ChunkHash):
+    async def delete_chunk(h: ChunkHash, older_than: float | None = None):
+        """Delete a chunk. With `older_than`, only if it was written more than that many seconds ago:
+        garbage collection uses this so it can never delete a copy that was just (re)written."""
+        if older_than is not None:
+            mtime = await asyncio.to_thread(lambda: store.path(h).stat().st_mtime if store.path(h).exists() else None)
+            if mtime is not None and time.time() - mtime < older_than:
+                raise HTTPException(409, "chunk was written too recently")
         if not await asyncio.to_thread(store.delete, h):
             raise HTTPException(404, "chunk not found")
 
     @app.get("/chunks")
-    async def list_chunks():
-        return {"node_id": node_id, "chunks": await asyncio.to_thread(store.hashes)}
+    async def list_chunks(older_than: float | None = None):
+        """Every stored chunk; `older_than=600` lists only those written more than 600 s ago."""
+        return {"node_id": node_id, "chunks": await asyncio.to_thread(store.hashes, older_than)}
 
     @app.post("/scrub")
     async def scrub():
@@ -183,5 +221,37 @@ def create_app() -> FastAPI:
     @app.get("/health")
     async def health():
         return {"node_id": node_id, "status": "ok", **await asyncio.to_thread(store.stats)}
+
+    # Kubernetes probes: /live answers as long as the process serves requests (liveness: restart it
+    # if not); /ready also checks that the data volume is mounted and writable (readiness).
+    @app.get("/live")
+    async def live():
+        return {"status": "alive"}
+
+    @app.get("/ready")
+    async def ready():
+        def writable() -> bool:
+            probe = store.tmp / ".ready"
+            probe.write_bytes(b"ok")
+            probe.unlink()
+            return True
+        try:
+            await asyncio.to_thread(writable)
+        except OSError as e:
+            raise HTTPException(503, f"data directory not writable: {e}")
+        return {"status": "ready"}
+
+    @app.get("/metrics", include_in_schema=False)
+    async def metrics():
+        return await asyncio.to_thread(metrics_response, registry)
+
+    if os.environ.get("FAULT_INJECTION") == "1":
+        @app.post("/fault/hang")
+        async def hang(seconds: float = 120):
+            """Test hook (only with FAULT_INJECTION=1): freeze the whole node so its liveness probe
+            fails, to show Kubernetes restarting it."""
+            log.warning("fault injection: freezing this node for %.0f s", seconds)
+            time.sleep(seconds)  # deliberately blocks the event loop: nothing is answered any more
+            return {"hung_for": seconds}
 
     return app

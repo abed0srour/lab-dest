@@ -3,3 +3,4 @@ uvicorn[standard]>=0.30
 httpx>=0.27
 fastcdc>=1.5
 zfec>=1.5
+prometheus_client>=0.20

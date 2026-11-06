@@ -1,9 +1,9 @@
 x-storage-node: &storage-node
-  build: ./storage_node
+  build: { context: ., dockerfile: storage_node/Dockerfile }
   image: dos/storage-node:latest
   restart: unless-stopped
   healthcheck:
-    test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+    test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/ready')"]
     interval: 10s
     timeout: 3s
     retries: 3
@@ -12,7 +12,7 @@ x-node-env: &node-env
   METADATA_URL: http://metadata:8000
   HEARTBEAT_INTERVAL: "5"
 
-# Redundancy settings, shared by the metadata service and the repair worker.
+# Redundancy settings, shared by the metadata service and the repair workers.
 x-redundancy: &redundancy
   REPLICAS: "3"          # N: copies of every chunk in replicated buckets
   WRITE_QUORUM: "2"      # W: copies that must be stored before an upload succeeds
@@ -22,7 +22,45 @@ x-redundancy: &redundancy
   EC_WRITE_QUORUM: "5"   # fragments that must be stored before an upload succeeds
   RING_VNODES: "128"     # virtual nodes per storage node on the hash ring
 
+# Both PostgreSQL nodes, in order: libpq connects to whichever one is the primary right now.
+x-database: &database
+  DATABASE_URL: "postgresql://dos:dos@pg-1:5432,pg-2:5432/dos?target_session_attrs=read-write&connect_timeout=2"
+
+x-postgres: &postgres
+  image: postgres:17-alpine
+  restart: unless-stopped
+  entrypoint: ["sh", "/usr/local/bin/ha-entrypoint.sh"]
+  healthcheck:
+    test: ["CMD", "pg_isready", "-U", "dos", "-d", "dos"]
+    interval: 5s
+    timeout: 3s
+    retries: 20
+
+x-postgres-env: &postgres-env
+  POSTGRES_USER: dos
+  POSTGRES_PASSWORD: dos
+  POSTGRES_DB: dos
+
+x-gateway: &gateway
+  build: { context: ., dockerfile: gateway/Dockerfile }
+  image: dos/gateway:latest
+  restart: unless-stopped
+  depends_on:
+    metadata: { condition: service_healthy }
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+    interval: 10s
+    timeout: 3s
+    retries: 3
+
+x-gateway-env: &gateway-env
+  METADATA_URL: http://metadata:8000
+  # key:user:requests per second (burst = 2 seconds' worth), enforced by each gateway. The demo key
+  # is slow on purpose, to show the rate limit; the bench key is for the workload benchmark.
+  API_KEYS: "student-key-2026:student:200,demo-key-2026:demo:5,bench-key-2026:bench:5000"
+
 services:
+  # ---- storage --------------------------------------------------------------------------------
   # 7 storage nodes: 6 for the 4 + 2 fragments of a chunk, plus one spare so a lost
   # fragment can be rebuilt on a node that does not already hold one of the others.
   storage-node-1:
@@ -67,19 +105,35 @@ services:
     volumes: [node7-data:/data]
     ports: ["8007:8000"]
 
-  postgres:
-    image: postgres:17-alpine
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: dos
-      POSTGRES_PASSWORD: dos
-      POSTGRES_DB: dos
-    volumes: [pg-data:/var/lib/postgresql/data]
-    healthcheck:
-      test: ["CMD", "pg_isready", "-U", "dos", "-d", "dos"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
+  # An extra node to show rebalancing; not started by default:
+  #   docker compose --profile extra-node up -d storage-node-8
+  storage-node-8:
+    <<: *storage-node
+    profiles: [extra-node]
+    environment: { <<: *node-env, NODE_ID: storage-node-8, NODE_PUBLIC_URL: "http://127.0.0.1:8008" }
+    volumes: [node8-data:/data]
+    ports: ["8008:8000"]
+
+  # ---- metadata store: PostgreSQL primary + standby with automatic failover -------------------
+  pg-1:
+    <<: *postgres
+    hostname: pg-1
+    environment: { <<: *postgres-env, PEER: pg-2, INITIAL_ROLE: primary }
+    volumes:
+      - pg-1-data:/var/lib/postgresql/data
+      - ./deploy/postgres/ha-entrypoint.sh:/usr/local/bin/ha-entrypoint.sh:ro
+      - ./deploy/postgres/10-replication.sh:/docker-entrypoint-initdb.d/10-replication.sh:ro
+
+  pg-2:
+    <<: *postgres
+    hostname: pg-2
+    environment: { <<: *postgres-env, PEER: pg-1, INITIAL_ROLE: standby }
+    volumes:
+      - pg-2-data:/var/lib/postgresql/data
+      - ./deploy/postgres/ha-entrypoint.sh:/usr/local/bin/ha-entrypoint.sh:ro
+      - ./deploy/postgres/10-replication.sh:/docker-entrypoint-initdb.d/10-replication.sh:ro
+    depends_on:
+      pg-1: { condition: service_healthy }
 
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:9.2.0
@@ -102,13 +156,12 @@ services:
     image: dos/metadata:latest
     restart: unless-stopped
     environment:
-      <<: *redundancy
-      DATABASE_URL: postgresql://dos:dos@postgres:5432/dos
+      <<: [*redundancy, *database]
       ES_URL: http://elasticsearch:9200   # object metadata is also indexed here for search
       NODE_TIMEOUT: "15"            # seconds without a heartbeat (3 missed beats) before a node is FAILED
       FAILURE_CHECK_INTERVAL: "2"
     depends_on:
-      postgres: { condition: service_healthy }
+      pg-1: { condition: service_healthy }
     ports: ["9000:8000"]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
@@ -116,44 +169,86 @@ services:
       timeout: 3s
       retries: 3
 
-  gateway:
-    build: { context: ., dockerfile: gateway/Dockerfile }
-    image: dos/gateway:latest
+  # ---- jobs: RabbitMQ distributes repair, rebalance, gc and scrub jobs over the workers -------
+  rabbitmq:
+    image: rabbitmq:4-management-alpine
     restart: unless-stopped
+    hostname: rabbitmq                 # RabbitMQ keeps its data under its host name
     environment:
-      METADATA_URL: http://metadata:8000
-      GATEWAY_ID: gateway-1
-      # key:user:requests per second (burst = 2 seconds' worth). The demo key is slow on purpose,
-      # to show the rate limit; the bench key is for the workload benchmark.
-      API_KEYS: "student-key-2026:student:200,demo-key-2026:demo:5,bench-key-2026:bench:5000"
-    depends_on:
-      metadata: { condition: service_healthy }
-    ports: ["8080:8000"]
+      RABBITMQ_DEFAULT_USER: dos
+      RABBITMQ_DEFAULT_PASS: dos
+    volumes: [rabbitmq-data:/var/lib/rabbitmq]
+    ports: ["15672:15672"]             # management UI: http://127.0.0.1:15672 (dos / dos)
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
       interval: 10s
-      timeout: 3s
-      retries: 3
-
-  ui:
-    build: ./ui
-    image: dos/ui:latest
-    restart: unless-stopped
-    depends_on: [gateway]
-    ports: ["5173:80"]   # http://127.0.0.1:5173
+      timeout: 10s
+      retries: 12
 
   repair-worker:
     build: { context: ., dockerfile: repair_worker/Dockerfile }
     image: dos/repair-worker:latest
     restart: unless-stopped
+    deploy:
+      replicas: 2                      # two workers share the RabbitMQ queues
     environment:
-      <<: *redundancy
-      DATABASE_URL: postgresql://dos:dos@postgres:5432/dos
+      <<: [*redundancy, *database]
+      RABBITMQ_URL: "amqp://dos:dos@rabbitmq:5672/%2F?heartbeat=600&connection_attempts=10&retry_delay=3"
       WORKER_THREADS: "8"
       SCRUB_INTERVAL: "600"         # scrub every node every 10 minutes (python scripts/cli.py scrub runs it now)
       SWEEP_INTERVAL: "30"          # look for degraded chunks without a repair job
+      GC_INTERVAL: "1800"           # look for orphan blobs on every node every 30 minutes
+      GC_MIN_AGE: "120"             # never collect a blob written in the last 2 minutes
     depends_on:
       metadata: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+
+  # ---- API: two gateways behind a load balancer ----------------------------------------------
+  gateway-1:
+    <<: *gateway
+    environment: { <<: *gateway-env, GATEWAY_ID: gateway-1 }
+
+  gateway-2:
+    <<: *gateway
+    environment: { <<: *gateway-env, GATEWAY_ID: gateway-2 }
+
+  lb:
+    image: nginx:alpine
+    restart: unless-stopped
+    volumes: [./deploy/nginx/lb.conf:/etc/nginx/conf.d/default.conf:ro]
+    ports: ["8080:80"]                 # the public API: http://127.0.0.1:8080
+    depends_on: [gateway-1, gateway-2]
+
+  ui:
+    build: ./ui
+    image: dos/ui:latest
+    restart: unless-stopped
+    depends_on: [lb]
+    ports: ["5173:80"]                 # http://127.0.0.1:5173
+
+  # ---- monitoring -----------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    restart: unless-stopped
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports: ["9090:9090"]               # http://127.0.0.1:9090
+
+  grafana:
+    image: grafana/grafana:12.1.0
+    restart: unless-stopped
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"          # open the dashboards without logging in
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_SECURITY_ADMIN_PASSWORD: admin          # log in as admin / admin to edit
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/storage.json
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports: ["3000:3000"]               # http://127.0.0.1:3000
+    depends_on: [prometheus]
 
 volumes:
   node1-data:
@@ -163,5 +258,10 @@ volumes:
   node5-data:
   node6-data:
   node7-data:
-  pg-data:
+  node8-data:
+  pg-1-data:
+  pg-2-data:
   es-data:
+  rabbitmq-data:
+  prometheus-data:
+  grafana-data:

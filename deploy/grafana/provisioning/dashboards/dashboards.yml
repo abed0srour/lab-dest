@@ -1,0 +1,6 @@
+apiVersion: 1
+providers:
+  - name: lab-dest
+    type: file
+    options:
+      path: /var/lib/grafana/dashboards

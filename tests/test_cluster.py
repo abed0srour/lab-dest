@@ -66,7 +66,7 @@ def test_duplicate_is_stored_once_and_removed_after_the_last_reference(client, k
     assert client.delete_object("pytest", key + "-a")["freed_chunks"] == 0
     assert client.get_object("pytest", key + "-b")["chunks"][0]["refcount"] == 1
     r = client.delete_object("pytest", key + "-b")
-    assert (r["freed_chunks"], r["removed_copies"]) == (1, 3)
+    assert (r["freed_chunks"], r["blobs_to_collect"]) == (1, 3)
 
 
 def test_uploading_the_same_key_again_creates_a_new_version(client, key, tmp_path):

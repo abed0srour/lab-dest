@@ -1,0 +1,8 @@
+# kubectl apply -k deploy/k8s
+resources:
+  - 00-namespace.yaml
+  - 10-postgres.yaml
+  - 20-metadata.yaml
+  - 30-storage-node.yaml
+  - 40-gateway.yaml
+  - 50-repair-worker.yaml

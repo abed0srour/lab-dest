@@ -1,0 +1,33 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: gateway
+    static_configs:
+      - targets: ["gateway-1:8000", "gateway-2:8000"]
+
+  - job_name: storage-node     # found through Docker's DNS, so the optional 8th node appears when started
+    dns_sd_configs:
+      - names: ["storage-node-1", "storage-node-2", "storage-node-3", "storage-node-4",
+                "storage-node-5", "storage-node-6", "storage-node-7", "storage-node-8"]
+        type: A
+        port: 8000
+        refresh_interval: 10s
+
+  - job_name: metadata         # cluster-wide gauges computed from the database: scraped less often
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["metadata:8000"]
+
+  - job_name: repair-worker    # every replica of the worker service, found through Docker's DNS
+    dns_sd_configs:
+      - names: ["repair-worker"]
+        type: A
+        port: 9100
+        refresh_interval: 10s
+
+  - job_name: rabbitmq         # per-queue message counts
+    metrics_path: /metrics/per-object
+    static_configs:
+      - targets: ["rabbitmq:15692"]

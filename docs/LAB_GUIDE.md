@@ -20,8 +20,8 @@ At the end you will find the **3 flowcharts** the report needs, a **Word report 
 | 4 | Redundancy and recovery | ✅ Done |
 | 5 | API gateway | ✅ Done |
 | 6 | Web UI + Elasticsearch search | ✅ Done |
-| 7 | Load balancing and fault tolerance (bonus) | ⬜ Next |
-| 8 | Cloud deployment (bonus) | ⬜ |
+| 7 | Load balancing and fault tolerance (bonus) | ✅ Done |
+| 8 | Cloud deployment (bonus) | ⬜ Next |
 
 ---
 
@@ -452,25 +452,56 @@ To work on the UI with live reload instead of Docker: `cd ui`, `npm install`, `n
 
 ## Phase 7 – Bonus: load balancing and fault tolerance
 
-**What gets built:**
+**What was built:**
 
-- **Nginx** in front of **2 gateway instances.** Each response carries an `X-Gateway-Id` header, so you can see requests alternate between them.
-- **RabbitMQ** queues for `repair`, `rebalance` and `gc` jobs, with 2 or more repair workers sharing the jobs.
-- **Kubernetes StatefulSet** for storage nodes, with persistent volumes, a **liveness** probe (`/health`) and a **readiness** probe, so a crashed node restarts automatically.
-- A **replicated metadata store:** PostgreSQL primary + streaming replica, or a 3-member etcd cluster.
-- **Prometheus + Grafana:** throughput, latency, disk usage per node, degraded objects, repair rate.
+| Part | What it does |
+|---|---|
+| **nginx load balancer** ([deploy/nginx/lb.conf](../deploy/nginx/lb.conf)) | Port **8080** is now nginx, in front of `gateway-1` and `gateway-2` (round robin). A gateway that refuses a connection is skipped for 5 s and the request goes to the other one. `X-Gateway-Id` shows which gateway answered |
+| **RabbitMQ** | Jobs are still recorded in PostgreSQL (state, bytes, progress). A dispatcher hands waiting jobs to four durable queues (`jobs.repair`, `jobs.rebalance`, `jobs.gc`, `jobs.scrub`). **Two worker replicas** take them, and a job is acknowledged only when it's finished, so a dying worker's job is delivered again. Management UI: http://127.0.0.1:15672 (`dos` / `dos`) |
+| **Rebalancing** | When a node joins (or comes back after a failure), a plan job compares every chunk with the hash ring and queues a move for each misplaced chunk. The old copy is removed by a gc job |
+| **Garbage collection** | Deleting an object queues a gc job for its blobs. An orphan gc lists each node's blobs older than 2 min and deletes those no chunk refers to. It runs when a node rejoins, after rebalancing, every 30 min, or with `cli.py gc`. A node refuses to delete a blob written seconds ago |
+| **Replicated PostgreSQL** ([deploy/postgres/ha-entrypoint.sh](../deploy/postgres/ha-entrypoint.sh)) | `pg-1` and `pg-2`: a primary plus a streaming standby. If the primary doesn't answer for 10 s, the standby promotes itself. A node that finds the other one already primary rejoins as its standby (never two primaries). The services connect to whichever is primary (`target_session_attrs=read-write`) |
+| **Prometheus + Grafana** ([deploy/prometheus/](../deploy/prometheus/), [deploy/grafana/](../deploy/grafana/)) | Every service has `/metrics`: requests, latency, bytes, disk per node, cluster gauges, jobs and repair traffic. Prometheus (http://127.0.0.1:9090) scrapes every 5 s. Grafana (http://127.0.0.1:3000) opens the 21-panel `lab-dest` dashboard directly |
+| **Kubernetes** ([deploy/k8s/](../deploy/k8s/)) | Namespace `dos`. Storage nodes are a **StatefulSet** of 7 pods (stable names `storage-node-0…6`), each with its own 1 Gi persistent volume, plus a **liveness probe** (`/live`: restart if it hangs) and a **readiness probe** (`/ready`: no traffic unless its volume is writable). Also PostgreSQL, metadata, 2 gateways behind a Service, and 2 workers |
+| [scripts/demo_phase7.ps1](../scripts/demo_phase7.ps1), [scripts/demo_phase7_k8s.ps1](../scripts/demo_phase7_k8s.ps1) | The Docker Compose demo and the Kubernetes demo, pausing after each step |
+
+**Measured:**
+
+| Test | Result |
+|---|---|
+| 40 requests while `gateway-1` is killed | 0 failed: 7 answered by gateway-1, then 33 by gateway-2 |
+| Node killed: repair through RabbitMQ | 726 repairs split 366 / 360 between the two workers; repaired 19 s after the kill |
+| Node back | Scrub, orphan gc and rebalancing ran on their own; 726 chunks moved back onto it |
+| PostgreSQL primary killed | Standby promoted after 10 s; the upload in flight waited 15 s and succeeded (201); the old primary came back as a standby |
+| `storage-node-8` added | 794 of 1,834 chunks moved (one copy each) in about 9 s; the new node holds about 14% of the blobs |
+| Kubernetes: node frozen | Readiness took it out of service, liveness restarted it after about 50 s, and its blobs were kept |
+| Kubernetes: pod deleted | Recreated in a few seconds with the same name, the same volume and the same blobs |
+
+**Check it works:**
+
+```powershell
+docker compose down -v ; docker compose up -d --build
+powershell -ExecutionPolicy Bypass -File scripts\demo_phase7.ps1
+powershell -ExecutionPolicy Bypass -File scripts\demo_phase7_k8s.ps1
+```
 
 | Fig | Screenshot | How to show it |
 |---|---|---|
-| 7.1 | Requests alternate between 2 gateways | `curl.exe -i` several times, showing `X-Gateway-Id` |
-| 7.2 | One gateway stopped, requests still succeed | `docker compose stop gateway-1`, then curl |
-| 7.3 | RabbitMQ queues and consumers | http://localhost:15672 |
-| 7.4 | Two workers sharing repair jobs | Worker logs side by side |
-| 7.5 | StatefulSet, pods and volumes | `kubectl get statefulset,pods,pvc` |
-| 7.6 | Deleted pod comes back automatically; probes configured | `kubectl delete pod storage-node-2`, then `kubectl get pods -w` and `kubectl describe pod` |
-| 7.7 | Metadata replication working | Replica status query, or a failover test |
-| 7.8 | Prometheus targets all UP | http://localhost:9090/targets |
-| 7.9 | Grafana dashboard | http://localhost:3000 |
+| 7.1 | All the services running | Compose demo step 1 |
+| 7.2 | Load balancing and a gateway failure with no failed request | Compose demo step 2 |
+| 7.3 | RabbitMQ queues with messages and consumers | http://127.0.0.1:15672 → Queues, during demo step 3 |
+| 7.4 | A node failure repaired by the two workers (repairs per worker) | Compose demo step 3 |
+| 7.5 | The node rejoins: scrub, gc and rebalance jobs | Compose demo step 4 |
+| 7.6 | PostgreSQL replication, primary killed, standby promoted | Compose demo step 5 |
+| 7.7 | The old primary rejoins as a standby | Compose demo step 6 |
+| 7.8 | A new node joins and rebalancing moves data onto it | Compose demo step 7 |
+| 7.9 | Prometheus targets all UP | http://127.0.0.1:9090/targets |
+| 7.10 | Grafana dashboard (best during demo steps 3 or 7) | http://127.0.0.1:3000 |
+| 7.11 | Kubernetes: StatefulSet, Deployments, Services | Kubernetes demo step 1 |
+| 7.12 | Kubernetes: 7 storage pods and their persistent volumes | Kubernetes demo step 2 |
+| 7.13 | Kubernetes: upload through the Service; requests spread over 2 gateways | Kubernetes demo step 3 |
+| 7.14 | Kubernetes: liveness probe restarts a frozen node | Kubernetes demo step 4 |
+| 7.15 | Kubernetes: a deleted pod comes back with the same volume | Kubernetes demo step 5 |
 
 ---
 

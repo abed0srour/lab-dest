@@ -1,5 +1,12 @@
 """Database schema and queries shared by the metadata service and the repair worker."""
 
+from psycopg.types.json import Jsonb
+from psycopg_pool.base import AttemptWithBackoff
+
+# Reconnect to the database every second instead of after growing gaps (1, 2, 4, 8, 16 s ...): after a
+# PostgreSQL failover the services then reach the new primary about a second after its promotion.
+AttemptWithBackoff.DELAY_BACKOFF = 1.0
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS nodes (
     node_id        TEXT PRIMARY KEY,
@@ -96,12 +103,34 @@ CREATE TABLE IF NOT EXISTS repair_jobs (
     bytes_written BIGINT NOT NULL DEFAULT 0,
     result        TEXT
 );
-CREATE UNIQUE INDEX IF NOT EXISTS one_pending_repair_per_chunk ON repair_jobs (chunk_hash, redundancy)
-    WHERE kind = 'repair' AND status = 'pending';
-CREATE UNIQUE INDEX IF NOT EXISTS one_scrub_per_node ON repair_jobs (node_id)
-    WHERE kind = 'scrub' AND status IN ('pending', 'running');
 CREATE INDEX IF NOT EXISTS repair_jobs_pending ON repair_jobs (id) WHERE status = 'pending';
+-- Phase 7: jobs are handed to RabbitMQ ('queued'), there are rebalance and garbage-collection jobs,
+-- and a job can carry a payload (e.g. the blobs a gc job must delete).
+ALTER TABLE repair_jobs ADD COLUMN IF NOT EXISTS queued_at TIMESTAMPTZ;
+ALTER TABLE repair_jobs ADD COLUMN IF NOT EXISTS detail JSONB;
+ALTER TABLE repair_jobs DROP CONSTRAINT IF EXISTS repair_jobs_status_check;
+ALTER TABLE repair_jobs ADD CONSTRAINT repair_jobs_status_check
+    CHECK (status IN ('pending', 'queued', 'running', 'done', 'failed'));
+ALTER TABLE repair_jobs DROP CONSTRAINT IF EXISTS repair_jobs_kind_check;
+ALTER TABLE repair_jobs ADD CONSTRAINT repair_jobs_kind_check CHECK (kind IN ('repair', 'scrub', 'rebalance', 'gc'));
+DROP INDEX IF EXISTS one_pending_repair_per_chunk;
+DROP INDEX IF EXISTS one_scrub_per_node;
+CREATE UNIQUE INDEX IF NOT EXISTS one_waiting_job_per_chunk ON repair_jobs (kind, chunk_hash, redundancy)
+    WHERE chunk_hash IS NOT NULL AND status IN ('pending', 'queued');
+CREATE UNIQUE INDEX IF NOT EXISTS one_job_per_node ON repair_jobs (kind, node_id)
+    WHERE chunk_hash IS NULL AND node_id IS NOT NULL AND status IN ('pending', 'queued', 'running');
+CREATE UNIQUE INDEX IF NOT EXISTS one_waiting_rebalance_plan ON repair_jobs (kind)
+    WHERE kind = 'rebalance' AND chunk_hash IS NULL AND status IN ('pending', 'queued');
 """
+
+# ON CONFLICT targets matching the partial unique indexes above (duplicate jobs are skipped).
+CHUNK_JOB_CONFLICT = ("ON CONFLICT (kind, chunk_hash, redundancy) "
+                      "WHERE chunk_hash IS NOT NULL AND status IN ('pending', 'queued') DO NOTHING")
+NODE_JOB_CONFLICT = ("ON CONFLICT (kind, node_id) WHERE chunk_hash IS NULL AND node_id IS NOT NULL "
+                     "AND status IN ('pending', 'queued', 'running') DO NOTHING")
+PLAN_JOB_CONFLICT = ("ON CONFLICT (kind) WHERE kind = 'rebalance' AND chunk_hash IS NULL "
+                     "AND status IN ('pending', 'queued') DO NOTHING")
+WAITING = "('pending', 'queued')"  # job statuses that mean "not started yet"
 
 # One row per chunk: how many healthy copies/fragments it has (on alive nodes, not reported bad),
 # how many it should have, how many it needs to be readable, and the resulting state.
@@ -124,12 +153,34 @@ CROSS JOIN LATERAL (
 """
 
 
-def enqueue_repair(conn, chunk_hash: str, redundancy: str, reason: str, node_id: str | None = None) -> bool:
-    """Queue a repair job unless one is already pending for this chunk. True if queued."""
+def enqueue_repair(conn, chunk_hash: str, redundancy: str, reason: str, node_id: str | None = None,
+                   kind: str = "repair") -> bool:
+    """Queue a repair (or rebalance) job for one chunk unless one is already waiting. True if queued."""
     return conn.execute(
-        """INSERT INTO repair_jobs (kind, chunk_hash, redundancy, node_id, reason) VALUES ('repair', %s, %s, %s, %s)
-           ON CONFLICT (chunk_hash, redundancy) WHERE kind = 'repair' AND status = 'pending' DO NOTHING""",
-        (chunk_hash, redundancy, node_id, reason)).rowcount == 1
+        f"""INSERT INTO repair_jobs (kind, chunk_hash, redundancy, node_id, reason) VALUES (%s, %s, %s, %s, %s)
+            {CHUNK_JOB_CONFLICT}""", (kind, chunk_hash, redundancy, node_id, reason)).rowcount == 1
+
+
+def enqueue_node_job(conn, kind: str, node_id: str, reason: str, delay: float = 0) -> bool:
+    """A scrub or orphan-collection job for one node (run in `delay` seconds), unless one is
+    already waiting or running."""
+    return conn.execute(
+        f"""INSERT INTO repair_jobs (kind, node_id, reason, run_after)
+            VALUES (%s, %s, %s, now() + make_interval(secs => %s)) {NODE_JOB_CONFLICT}""",
+        (kind, node_id, reason, delay)).rowcount == 1
+
+
+def enqueue_rebalance_plan(conn, reason: str) -> bool:
+    """A job that compares every chunk's placement with the hash ring and queues the moves needed."""
+    return conn.execute(f"""INSERT INTO repair_jobs (kind, reason) VALUES ('rebalance', %s) {PLAN_JOB_CONFLICT}""",
+                        (reason,)).rowcount == 1
+
+
+def enqueue_blob_deletes(conn, blobs: list[tuple[str, str]], reason: str) -> None:
+    """A garbage-collection job that deletes these (blob_hash, node_id) copies, if still unreferenced."""
+    if blobs:
+        conn.execute("INSERT INTO repair_jobs (kind, reason, detail) VALUES ('gc', %s, %s)",
+                     (reason, Jsonb({"blobs": [list(b) for b in blobs]})))
 
 
 def report_bad_copy(conn, chunk_hash: str, redundancy: str, fragment: int, node_id: str, reason: str) -> None:

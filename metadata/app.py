@@ -18,12 +18,16 @@ from typing import Annotated
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi import Path as PathParam
+from prometheus_client import CollectorRegistry
+from prometheus_client.core import GaugeMetricFamily
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 from pydantic import BaseModel, Field
 
-from common.db import CHUNK_STATES, SCHEMA, alive_nodes, enqueue_repair, report_bad_copy
+from common.db import (CHUNK_JOB_CONFLICT, CHUNK_STATES, SCHEMA, WAITING, alive_nodes, enqueue_blob_deletes,
+                       enqueue_node_job, enqueue_rebalance_plan, enqueue_repair, report_bad_copy)
+from common.metrics import MetricsMiddleware, metrics_response
 from common.ring import HashRing
 from metadata.search_index import SearchIndex
 
@@ -110,18 +114,32 @@ def create_app() -> FastAPI:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)  # no line per request to nodes / Elasticsearch
     cfg = Settings()
+    # DATABASE_URL may list several PostgreSQL hosts with target_session_attrs=read-write (Phase 7):
+    # libpq then connects to whichever one is the primary. check= drops connections broken by a failover.
     pool = ConnectionPool(
         os.environ.get("DATABASE_URL", "postgresql://dos:dos@localhost:5432/dos"),
         min_size=2, max_size=20, open=False, kwargs={"row_factory": dict_row},
+        check=ConnectionPool.check_connection,
     )
     stop = threading.Event()
-    index = SearchIndex(pool, os.environ.get("ES_URL", "http://elasticsearch:9200"))
+    es_url = os.environ.get("ES_URL", "http://elasticsearch:9200")
+    index = SearchIndex(pool, es_url) if es_url else None
 
     def failure_detector():
-        """Mark nodes that stopped sending heartbeats as failed and queue repairs for their chunks."""
+        """Mark nodes that stopped sending heartbeats as failed and queue repairs for their chunks.
+
+        Only after the detector itself has reached the database for a full timeout: if the metadata
+        service was down (or the database was failing over), the missing heartbeats are its own fault,
+        not the nodes', and every node would otherwise be marked failed at once.
+        """
+        healthy_since = None
         while not stop.wait(cfg.check_interval):
             try:
                 with pool.connection() as conn:
+                    now = conn.execute("SELECT EXTRACT(EPOCH FROM now())::float AS t").fetchone()["t"]
+                    healthy_since = healthy_since or now
+                    if now - healthy_since < cfg.node_timeout:
+                        continue
                     failed = conn.execute(
                         """UPDATE nodes SET status = 'failed', failed_at = now()
                            WHERE status = 'alive' AND last_heartbeat < now() - make_interval(secs => %s)
@@ -129,15 +147,15 @@ def create_app() -> FastAPI:
                         (cfg.node_timeout,)).fetchall()
                     for f in failed:
                         queued = conn.execute(
-                            """INSERT INTO repair_jobs (kind, chunk_hash, redundancy, node_id, reason)
-                               SELECT DISTINCT 'repair', chunk_hash, redundancy, node_id, 'node failed'
-                               FROM chunk_locations WHERE node_id = %s
-                               ON CONFLICT (chunk_hash, redundancy) WHERE kind = 'repair' AND status = 'pending'
-                               DO NOTHING""", (f["node_id"],)).rowcount
+                            f"""INSERT INTO repair_jobs (kind, chunk_hash, redundancy, node_id, reason)
+                                SELECT DISTINCT 'repair', chunk_hash, redundancy, node_id, 'node failed'
+                                FROM chunk_locations WHERE node_id = %s {CHUNK_JOB_CONFLICT}""",
+                            (f["node_id"],)).rowcount
                         log.warning("node %s marked FAILED: no heartbeat for %.1f s; %d repair jobs queued",
                                     f["node_id"], f["silent"], queued)
-            except Exception:
-                log.exception("failure detector error")
+            except Exception as e:
+                healthy_since = None
+                log.warning("failure detector cannot reach the database: %r", e)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -149,7 +167,8 @@ def create_app() -> FastAPI:
                  cfg.node_timeout)
         detector = threading.Thread(target=failure_detector, daemon=True)
         detector.start()
-        index.start()
+        if index:
+            index.start()
         yield
         stop.set()
         pool.close()
@@ -179,14 +198,22 @@ def create_app() -> FastAPI:
                      url = EXCLUDED.url, public_url = EXCLUDED.public_url, free_bytes = EXCLUDED.free_bytes,
                      chunk_count = EXCLUDED.chunk_count, last_heartbeat = now(), status = 'alive', failed_at = NULL""",
                 (hb.node_id, hb.url, hb.public_url, hb.free_bytes, hb.chunk_count))
+            has_data = prev is None or prev["status"] == "failed"
+            has_data = has_data and conn.execute("SELECT EXISTS (SELECT 1 FROM chunks) AS e").fetchone()["e"]
             if prev is None:
                 log.info("node %s joined the cluster", hb.node_id)
+                if has_data:  # a new node owns part of the ring now: move its share of the data onto it
+                    enqueue_rebalance_plan(conn, f"{hb.node_id} joined")
+                    log.info("rebalancing queued: some chunks now belong on %s", hb.node_id)
             elif prev["status"] == "failed":
-                # Its disk may hold copies that missed updates or decayed while it was away.
-                conn.execute("""INSERT INTO repair_jobs (kind, node_id, reason) VALUES ('scrub', %s, 'node rejoined')
-                                ON CONFLICT (node_id) WHERE kind = 'scrub' AND status IN ('pending', 'running')
-                                DO NOTHING""", (hb.node_id,))
-                log.info("node %s is back after a failure; it rejoins the ring and will be scrubbed", hb.node_id)
+                # Its disk may hold copies that decayed while it was away (scrub), copies that were rebuilt
+                # elsewhere and are now orphans (gc), and its ring share went to other nodes (rebalance).
+                enqueue_node_job(conn, "scrub", hb.node_id, "node rejoined")
+                enqueue_node_job(conn, "gc", hb.node_id, "node rejoined")
+                if has_data:
+                    enqueue_rebalance_plan(conn, f"{hb.node_id} rejoined")
+                log.info("node %s is back after a failure: it rejoins the ring; scrub, garbage collection "
+                         "and rebalancing queued", hb.node_id)
         return {"ok": True}
 
     @app.get("/nodes")
@@ -320,7 +347,8 @@ def create_app() -> FastAPI:
                     """INSERT INTO object_chunks (object_id, seq, chunk_hash, redundancy, offset_bytes)
                        VALUES (%s, %s, %s, %s, %s)""", rows)
 
-        index.touch(bucket, key)
+        if index:
+            index.touch(bucket, key)
         return {"bucket": bucket, "key": key, "version": version, "size": body.size, "redundancy": redundancy,
                 "sha256": body.sha256, "content_type": body.content_type, "tags": body.tags,
                 "created_at": obj["created_at"], "chunks": len(body.chunks), "new_chunks": new,
@@ -384,6 +412,8 @@ def create_app() -> FastAPI:
             tags = dict(t.split("=", 1) for t in tag)
         except ValueError:
             raise HTTPException(400, "tag filters look like tag=type=video")
+        if index is None:
+            raise HTTPException(503, "search index disabled (ES_URL is empty)")
         try:
             return index.search(q, bucket, prefix, min_size, max_size, after.isoformat() if after else None,
                                 before.isoformat() if before else None, tags, limit)
@@ -392,11 +422,15 @@ def create_app() -> FastAPI:
 
     @app.get("/search/status")
     def search_status():
+        if index is None:
+            return {"elasticsearch": "disabled", "indexed_objects": 0, "waiting_to_index": 0, "url": None}
         return index.status()
 
     @app.post("/search/reindex")
     def search_reindex():
         """Rebuild the Elasticsearch index from PostgreSQL."""
+        if index is None:
+            raise HTTPException(503, "search index disabled (ES_URL is empty)")
         try:
             return {"reindexed": index.reindex()}
         except httpx.HTTPError as e:
@@ -459,31 +493,21 @@ def create_app() -> FastAPI:
                         freed_r.append(r["redundancy"])
                 freed = "(SELECT * FROM unnest(%s::text[], %s::text[]))"
                 garbage = conn.execute(
-                    f"""SELECT l.blob_hash, l.node_id, n.url, n.status FROM chunk_locations l
-                        JOIN nodes n ON n.node_id = l.node_id
-                        WHERE (l.chunk_hash, l.redundancy) IN {freed}""", (freed_h, freed_r)).fetchall()
+                    f"""SELECT blob_hash, node_id FROM chunk_locations
+                        WHERE (chunk_hash, redundancy) IN {freed}""", (freed_h, freed_r)).fetchall()
                 conn.execute(f"DELETE FROM chunks WHERE (hash, redundancy) IN {freed} AND refcount = 0",
                              (freed_h, freed_r))
                 conn.execute(f"DELETE FROM bad_copies WHERE (chunk_hash, redundancy) IN {freed}", (freed_h, freed_r))
-                # A blob can be shared, e.g. identical fragments of different chunks: keep those still referenced.
-                still_used = {(r["blob_hash"], r["node_id"]) for r in conn.execute(
-                    "SELECT blob_hash, node_id FROM chunk_locations WHERE blob_hash = ANY(%s)",
-                    ([g["blob_hash"] for g in garbage],))}
+                # The copies themselves are deleted from the nodes by a garbage-collection job, in the same
+                # transaction so it can never be lost. The worker re-checks that nothing uses them any more
+                # (a blob can be shared, e.g. identical fragments of different chunks).
+                blobs = [(g["blob_hash"], g["node_id"]) for g in garbage]
+                enqueue_blob_deletes(conn, blobs, f"deleted {bucket}/{key}")
 
-        index.touch(bucket, key)
-        # Remove the unreferenced blobs from the nodes after the commit (best effort: blobs on failed
-        # nodes stay as orphans until those nodes are cleaned).
-        removed = 0
-        with httpx.Client(timeout=10) as client:
-            for g in garbage:
-                if g["status"] != "alive" or (g["blob_hash"], g["node_id"]) in still_used:
-                    continue
-                try:
-                    removed += client.delete(f"{g['url']}/chunks/{g['blob_hash']}").status_code in (204, 404)
-                except httpx.HTTPError as e:
-                    log.warning("could not delete blob %s from %s: %r", g["blob_hash"], g["node_id"], e)
+        if index:
+            index.touch(bucket, key)
         return {"bucket": bucket, "key": key, "deleted_versions": len(ids),
-                "freed_chunks": len(freed_h), "removed_copies": removed}
+                "freed_chunks": len(freed_h), "blobs_to_collect": len(blobs)}
 
     # ---- integrity: reports from readers, scrub requests ------------------
 
@@ -498,14 +522,28 @@ def create_app() -> FastAPI:
 
     @app.post("/scrub")
     def scrub():
-        """Ask the repair worker to scrub every alive node now."""
+        """Ask the repair workers to scrub every alive node now."""
         with pool.connection() as conn:
             nodes = sorted(alive_nodes(conn, cfg.node_timeout))
             for node in nodes:
-                conn.execute("""INSERT INTO repair_jobs (kind, node_id, reason) VALUES ('scrub', %s, 'requested')
-                                ON CONFLICT (node_id) WHERE kind = 'scrub' AND status IN ('pending', 'running')
-                                DO NOTHING""", (node,))
+                enqueue_node_job(conn, "scrub", node, "requested")
         return {"scrub_queued_for": nodes}
+
+    @app.post("/gc")
+    def gc():
+        """Ask the workers to delete, on every alive node, the blobs no chunk location refers to."""
+        with pool.connection() as conn:
+            nodes = sorted(alive_nodes(conn, cfg.node_timeout))
+            for node in nodes:
+                enqueue_node_job(conn, "gc", node, "requested")
+        return {"gc_queued_for": nodes}
+
+    @app.post("/rebalance")
+    def rebalance():
+        """Ask the workers to move copies so every chunk sits where the hash ring places it now."""
+        with pool.connection() as conn:
+            queued = enqueue_rebalance_plan(conn, "requested")
+        return {"rebalance_queued": queued}
 
     # ---- statistics and health ---------------------------------------------
 
@@ -558,14 +596,19 @@ def create_app() -> FastAPI:
         for r in chunk_rows:
             chunks[r["state"]] += r["n"]
             by_redundancy.setdefault(r["redundancy"], {"healthy": 0, "degraded": 0, "lost": 0})[r["state"]] = r["n"]
-        queue = {kind: {s: 0 for s in ("pending", "running", "done", "failed")} for kind in ("repair", "scrub")}
+        # "pending" counts every job not started yet, including those already handed to RabbitMQ ("queued").
+        queue = {kind: {s: 0 for s in ("pending", "queued", "running", "done", "failed")}
+                 for kind in ("repair", "scrub", "rebalance", "gc")}
         for j in jobs:
-            queue[j["kind"]][j["status"]] = j["n"]
+            queue[j["kind"]][j["status"]] += j["n"]
+            if j["status"] == "queued":
+                queue[j["kind"]]["pending"] += j["n"]
         return {
             "nodes": {"total": len(nodes), "alive": sum(n["status"] == "alive" for n in nodes),
                       "failed": [n["node_id"] for n in nodes if n["status"] == "failed"], "list": nodes},
             "chunks": {**chunks, "by_redundancy": by_redundancy},
             "objects": objects, "repair_jobs": queue["repair"], "scrub_jobs": queue["scrub"],
+            "rebalance_jobs": queue["rebalance"], "gc_jobs": queue["gc"],
             "settings": {"N": cfg.replicas, "W": cfg.write_quorum, "R": cfg.read_quorum,
                          "ec": f"{cfg.ec_k}+{cfg.ec_m}", "node_timeout_s": cfg.node_timeout},
         }
@@ -575,8 +618,8 @@ def create_app() -> FastAPI:
         """Repair work and traffic per redundancy scheme (optionally for one bucket, or jobs after since_id)."""
         with pool.connection() as conn:
             rows = conn.execute(
-                """SELECT j.redundancy, count(*) AS jobs,
-                          count(*) FILTER (WHERE status = 'pending') AS pending,
+                f"""SELECT j.redundancy, count(*) AS jobs,
+                          count(*) FILTER (WHERE status IN {WAITING}) AS pending,
                           count(*) FILTER (WHERE status = 'running') AS running,
                           count(*) FILTER (WHERE status = 'done') AS done,
                           count(*) FILTER (WHERE status = 'failed') AS failed,
@@ -593,5 +636,62 @@ def create_app() -> FastAPI:
                    GROUP BY j.redundancy ORDER BY j.redundancy""", {"b": bucket, "since": since_id}).fetchall()
             last = conn.execute("SELECT coalesce(max(id), 0) AS id FROM repair_jobs").fetchone()["id"]
         return {"bucket": bucket, "since_id": since_id, "last_job_id": last, "by_redundancy": rows}
+
+    # ---- Prometheus --------------------------------------------------------
+
+    class ClusterCollector:
+        """Cluster-wide gauges, read from the database when Prometheus scrapes."""
+
+        def collect(self):
+            try:
+                with pool.connection() as conn:
+                    nodes = conn.execute("SELECT status, count(*) AS n FROM nodes GROUP BY status").fetchall()
+                    blobs = conn.execute("""SELECT n.node_id, count(l.node_id) AS n FROM nodes n
+                                            LEFT JOIN chunk_locations l ON l.node_id = n.node_id
+                                            GROUP BY n.node_id""").fetchall()
+                    jobs = conn.execute("SELECT kind, status, count(*) AS n FROM repair_jobs GROUP BY kind, status")
+                    jobs = jobs.fetchall()
+                    states = conn.execute(
+                        f"SELECT redundancy, state, count(*) AS n FROM ({CHUNK_STATES}) s GROUP BY 1, 2").fetchall()
+                    obj = conn.execute(
+                        f"""WITH s AS ({CHUNK_STATES})
+                            SELECT (SELECT count(*) FROM objects) AS total,
+                                   count(*) FILTER (WHERE worst = 1) AS degraded,
+                                   count(*) FILTER (WHERE worst = 2) AS lost
+                            FROM (SELECT oc.object_id, max(CASE s.state WHEN 'lost' THEN 2
+                                                                        WHEN 'degraded' THEN 1 ELSE 0 END) AS worst
+                                  FROM object_chunks oc JOIN s ON s.hash = oc.chunk_hash
+                                       AND s.redundancy = oc.redundancy GROUP BY oc.object_id) x""").fetchone()
+            except Exception as e:
+                log.warning("metrics: database not reachable: %r", e)
+                return
+            g = GaugeMetricFamily("dos_nodes", "Storage nodes by status", labels=["status"])
+            for r in nodes:
+                g.add_metric([r["status"]], r["n"])
+            yield g
+            g = GaugeMetricFamily("dos_node_assigned_blobs", "Blobs the metadata places on each node", labels=["node"])
+            for r in blobs:
+                g.add_metric([r["node_id"]], r["n"])
+            yield g
+            g = GaugeMetricFamily("dos_objects", "Objects by state", labels=["state"])
+            for state in ("total", "degraded", "lost"):
+                g.add_metric([state], obj[state])
+            yield g
+            g = GaugeMetricFamily("dos_chunks", "Chunks by redundancy and state", labels=["redundancy", "state"])
+            for r in states:
+                g.add_metric([r["redundancy"], r["state"]], r["n"])
+            yield g
+            g = GaugeMetricFamily("dos_jobs", "Background jobs by kind and status", labels=["kind", "status"])
+            for r in jobs:
+                g.add_metric([r["kind"], r["status"]], r["n"])
+            yield g
+
+    registry = CollectorRegistry()
+    registry.register(ClusterCollector())
+    app.add_middleware(MetricsMiddleware, service="metadata")
+
+    @app.get("/metrics", include_in_schema=False)
+    def metrics():
+        return metrics_response(registry)
 
     return app

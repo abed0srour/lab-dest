@@ -113,6 +113,12 @@ class StorageClient:
     def scrub(self) -> dict:
         return self._meta("POST", "/scrub")
 
+    def rebalance(self) -> dict:
+        return self._meta("POST", "/rebalance")
+
+    def gc(self) -> dict:
+        return self._meta("POST", "/gc")
+
     def create_bucket(self, bucket: str, redundancy: str = "replication") -> dict:
         return self._meta("PUT", f"/buckets/{bucket}", json={"redundancy": redundancy})
 

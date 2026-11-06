@@ -1,0 +1,24 @@
+# Two workers. Without RABBITMQ_URL they share the job queue directly in PostgreSQL
+# (FOR UPDATE SKIP LOCKED); the Docker Compose stack runs them through RabbitMQ.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: repair-worker
+  namespace: dos
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: repair-worker }
+  template:
+    metadata:
+      labels: { app: repair-worker }
+    spec:
+      containers:
+        - name: repair-worker
+          image: dos/repair-worker:latest
+          imagePullPolicy: Always   # Docker Desktop serves locally built images to Kubernetes
+          envFrom: [{ configMapRef: { name: dos-config } }]
+          env:
+            - name: WORKER_ID
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - { name: GC_MIN_AGE, value: "120" }

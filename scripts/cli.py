@@ -130,7 +130,7 @@ def cmd_rm(c: StorageClient, a) -> None:
     r = c.delete_object(a.bucket, a.key, a.version)
     print(f"Deleted {a.bucket}/{a.key} ({r['deleted_versions']} version(s)). "
           f"Freed {r['freed_chunks']} chunk(s) no longer used by any object; "
-          f"removed {r['removed_copies']} copies from the storage nodes.")
+          f"{r['blobs_to_collect']} copies queued for garbage collection on the storage nodes.")
 
 
 def cmd_stats(c: StorageClient, a) -> None:
@@ -206,6 +206,28 @@ def cmd_scrub(c: StorageClient, a) -> None:
     r = c.scrub()
     print(f"Scrub queued for {len(r['scrub_queued_for'])} nodes: {', '.join(r['scrub_queued_for'])}")
     print("The repair worker re-hashes every blob on each node; follow it with: docker compose logs -f repair-worker")
+
+
+def cmd_rebalance(c: StorageClient, a) -> None:
+    r = c.rebalance()
+    print("Rebalance queued: a worker compares every chunk with the hash ring and queues the moves."
+          if r["rebalance_queued"] else "A rebalance is already waiting to run.")
+
+
+def cmd_gc(c: StorageClient, a) -> None:
+    r = c.gc()
+    print(f"Orphan garbage collection queued for {len(r['gc_queued_for'])} nodes: {', '.join(r['gc_queued_for'])}")
+
+
+def cmd_jobs(c: StorageClient, a) -> None:
+    h = c.cluster()
+    rows = []
+    for kind in ("repair", "rebalance", "gc", "scrub"):
+        q = h.get(f"{kind}_jobs")
+        if q:
+            rows.append([kind, q["pending"] - q.get("queued", 0), q.get("queued", 0), q["running"], q["done"],
+                         q["failed"]])
+    table(rows, ["KIND", "WAITING", "IN RABBITMQ", "RUNNING", "DONE", "FAILED"])
 
 
 def cmd_put_dir(c: StorageClient, a) -> None:
@@ -287,6 +309,9 @@ def main() -> None:
     s.add_argument("--since", type=int, default=0, help="only jobs with an id above this")
     s.set_defaults(fn=cmd_repairs)
     sub.add_parser("scrub", help="scrub every node now").set_defaults(fn=cmd_scrub)
+    sub.add_parser("rebalance", help="move copies to where the hash ring places them").set_defaults(fn=cmd_rebalance)
+    sub.add_parser("gc", help="delete orphan blobs on every node").set_defaults(fn=cmd_gc)
+    sub.add_parser("jobs", help="background jobs by kind and status").set_defaults(fn=cmd_jobs)
 
     a = p.parse_args()
     try:

@@ -1,9 +1,11 @@
+# Build context is the repository root (the node needs common/ for its metrics).
 FROM python:3.12-slim
 
 WORKDIR /app
-COPY requirements.txt .
+COPY storage_node/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY __init__.py app.py storage_node/
+COPY common/ common/
+COPY storage_node/__init__.py storage_node/app.py storage_node/
 
 ENV DATA_DIR=/data
 VOLUME /data

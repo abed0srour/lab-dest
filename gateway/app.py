@@ -28,6 +28,7 @@ from fastapi.security import APIKeyHeader
 from starlette.requests import ClientDisconnect
 
 from common.client import StorageClient, StorageError
+from common.metrics import MetricsMiddleware, metrics_response
 
 log = logging.getLogger("gateway")
 
@@ -178,6 +179,11 @@ def create_app() -> FastAPI:
                   lifespan=lifespan)
 
     app.add_middleware(GatewayIdHeader, gateway_id=gateway_id)
+    app.add_middleware(MetricsMiddleware, service="gateway")
+
+    @app.get("/metrics", include_in_schema=False)
+    def metrics():
+        return metrics_response()
 
     @app.exception_handler(StorageError)
     async def storage_error(request: Request, e: StorageError):
@@ -343,6 +349,16 @@ def create_app() -> FastAPI:
     def cluster_scrub():
         """Re-check every stored chunk on every node now; bad copies are repaired."""
         return storage.scrub()
+
+    @api.post("/cluster/rebalance", tags=["status"])
+    def cluster_rebalance():
+        """Move copies so that every chunk sits on the nodes the hash ring assigns it to now."""
+        return storage._meta("POST", "/rebalance")
+
+    @api.post("/cluster/gc", tags=["status"])
+    def cluster_gc():
+        """Delete blobs that no object references any more (e.g. on a node that came back after a failure)."""
+        return storage._meta("POST", "/gc")
 
     app.include_router(api)
     return app

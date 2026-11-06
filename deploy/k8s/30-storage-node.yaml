@@ -1,0 +1,61 @@
+# Storage nodes as a StatefulSet: every pod keeps a stable name (storage-node-0, -1, ...) and its own
+# persistent volume, so a pod that is restarted or recreated comes back with the same identity
+# and the same chunks.
+#  - liveness probe  (/live):  the process answers. If not, Kubernetes restarts the container.
+#  - readiness probe (/ready): the data volume is mounted and writable. If not, the pod gets no traffic.
+apiVersion: v1
+kind: Service
+metadata:
+  name: storage-node             # headless: gives each pod a DNS name, storage-node-N.storage-node
+  namespace: dos
+spec:
+  clusterIP: None
+  selector: { app: storage-node }
+  ports: [{ port: 8000 }]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: storage-node
+  namespace: dos
+spec:
+  serviceName: storage-node
+  replicas: 7
+  podManagementPolicy: Parallel   # start all nodes at once (they are independent)
+  selector:
+    matchLabels: { app: storage-node }
+  template:
+    metadata:
+      labels: { app: storage-node }
+    spec:
+      containers:
+        - name: storage-node
+          image: dos/storage-node:latest
+          imagePullPolicy: Always   # Docker Desktop serves locally built images to Kubernetes
+          env:
+            - name: NODE_ID
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - { name: NODE_URL, value: "http://$(NODE_ID).storage-node:8000" }
+            - { name: METADATA_URL, value: "http://metadata:8000" }
+            - { name: HEARTBEAT_INTERVAL, value: "5" }
+            - { name: DATA_DIR, value: /data }
+            - { name: FAULT_INJECTION, value: "1" }   # enables POST /fault/hang for the liveness demo
+          ports: [{ containerPort: 8000 }]
+          volumeMounts: [{ name: data, mountPath: /data }]
+          livenessProbe:
+            httpGet: { path: /live, port: 8000 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /ready, port: 8000 }
+            periodSeconds: 5
+            failureThreshold: 2
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 512Mi }
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources: { requests: { storage: 1Gi } }
